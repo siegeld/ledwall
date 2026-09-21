@@ -1,0 +1,115 @@
+# name: metro-north
+# description: Metro-North Harlem line rail board, fed by the metro-north data provider
+#
+# Three scenes that page like a real station board, because 128px of height will
+# not hold departures, arrivals and running trains at a legible size.
+#
+# Every value comes from the `metro-north` data provider via the `rows` layer
+# and {data:...}; the render path makes no network call. See doc/providers.md.
+#
+# ROW COUNT COMES FROM THE FEED. Six trains draw six rows, three draw three,
+# and the rest of the box stays dark. An earlier version of this file spelled
+# every row out as three text layers with the index baked into the path -- 18
+# layers a scene, 54 in the file -- which meant a quiet hour rendered a column
+# of no-value glyphs that looked like data, and moving a column by 2px was
+# eighteen separate edits.
+#
+# COLUMN WIDTHS ARE MEASURED, NOT GUESSED. The house font is DejaVu Sans BOLD,
+# which is far wider than it looks in an editor: at size 9 "13:42" is 29px of
+# the 128 available, so the time column is 33 and not the 30 that looked
+# generous. Laying this out by eye produced a board reading "13:4:". Measure
+# before you move one:
+#
+#     docker compose exec -T api python -c "import sys; sys.path.insert(0,'/app'); \
+#       from marquee_core.render import _load_font; print(_load_font(9).getbbox('13:42'))"
+#
+# `scroll: auto` on the destination is load-bearing: it leaves "Southeast"
+# still and scrolls "North White Plains", so the column is sized for the common
+# case rather than for the longest name on the line.
+#
+# COLUMN WIDTHS COME FROM THE STATION LIST, not from eye. All 31 Harlem-line
+# names were measured against candidate widths: at size 9 a 63px destination
+# column leaves the common terminals static and scrolls only the long ones,
+# and "North White Plains" (96px) scrolls in any layout that also carries a
+# time and a countdown.
+#
+# `col_gap: 3`, not 1. A scrolling cell fills its whole width by definition,
+# so at a 1px gap the tail of a scrolling station name sits hard against the
+# time beside it and the two read as one word. The gap is what keeps a
+# scrolling column separate from a static one.
+#
+# The countdown column is the provider's `countdown` field, which reads "Now",
+# "7m" or "" -- blank beyond an hour. That belongs to the provider because the
+# scene language has no conditionals, by design.
+display: {width: 128, height: 128, fps: 10, format: rgb}
+transition: {type: crossfade, duration: 0.4s}
+
+scenes:
+  - name: departures
+    duration: 12s
+    layers:
+      - {type: solid, color: "#05070d", box: [0, 0, 128, 128]}
+      - {type: gradient, start: "#12233d", end: "#05070d", box: [0, 0, 128, 15], angle: v}
+      - {type: text, text: "DEPARTURES", box: [2, 2, 93, 12], size: 10, color: "#C9A84C"}
+      - {type: text, text: "{clock:%H:%M}", box: [97, 3, 29, 11], size: 9, align: right, color: "#8899aa"}
+
+      - type: rows
+        data: "mnr.harlem|departures"
+        box: [1, 17, 126, 90]
+        row_height: 15
+        size: 9
+        col_gap: 3
+        columns:
+          - {field: time,        w: 31, color: "#e6edf3"}
+          - {field: destination, w: 63, color: "#C9A84C", scroll: auto, speed: 16}
+          - {field: countdown,   w: 26, color: "#8899aa", align: right}
+
+      - {type: text, text: "{data:mnr.harlem|station}", box: [2, 111, 124, 13], size: 9, align: center, color: "#55657a"}
+
+  - name: arrivals
+    duration: 12s
+    layers:
+      - {type: solid, color: "#05070d", box: [0, 0, 128, 128]}
+      - {type: gradient, start: "#12233d", end: "#05070d", box: [0, 0, 128, 15], angle: v}
+      - {type: text, text: "ARRIVALS", box: [2, 2, 93, 12], size: 10, color: "#C9A84C"}
+      - {type: text, text: "{clock:%H:%M}", box: [97, 3, 29, 11], size: 9, align: right, color: "#8899aa"}
+
+      - type: rows
+        data: "mnr.harlem|arrivals"
+        box: [1, 17, 126, 90]
+        row_height: 15
+        size: 9
+        col_gap: 3
+        columns:
+          - {field: time,      w: 31, color: "#e6edf3"}
+          - {field: from,      w: 63, color: "#C9A84C", scroll: auto, speed: 16}
+          - {field: countdown, w: 26, color: "#8899aa", align: right}
+
+      - {type: text, text: "into {data:mnr.harlem|station}", box: [2, 111, 124, 13], size: 9, align: center, color: "#55657a"}
+
+  - name: on-the-line
+    duration: 12s
+    layers:
+      - {type: solid, color: "#05070d", box: [0, 0, 128, 128]}
+      - {type: gradient, start: "#12233d", end: "#05070d", box: [0, 0, 128, 15], angle: v}
+      - {type: text, text: "ON THE LINE", box: [2, 2, 93, 12], size: 10, color: "#C9A84C"}
+      - {type: text, text: "{clock:%H:%M}", box: [97, 3, 29, 11], size: 9, align: right, color: "#8899aa"}
+
+      # Every train already running, its next station, and when it gets there.
+      - type: rows
+        data: "mnr.harlem|trains"
+        box: [1, 17, 126, 90]
+        row_height: 15
+        size: 9
+        col_gap: 4
+        columns:
+          # No train-number column here, and that is a width decision made from
+          # measurement rather than taste. Squeezing one in leaves 65px for the
+          # station, which leaves 77% of Harlem-line names scrolling; at 92px
+          # it is 93% static and the board is calm. Put it back by adding one
+          # line -- {field: train, w: 24, size: 8, color: "#8899aa"} -- which
+          # is the point of this layer.
+          - {field: next_stop, w: 92, color: "#e6edf3", scroll: auto, speed: 16}
+          - {field: next_time, w: 29, color: "#C9A84C", align: right}
+
+      - {type: text, text: "{data:mnr.harlem|line} line", box: [2, 111, 124, 13], size: 9, align: center, color: "#55657a"}

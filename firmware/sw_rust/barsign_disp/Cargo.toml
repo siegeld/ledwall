@@ -1,0 +1,45 @@
+[package]
+name = "barsign-disp"
+version = "2.13.0"
+authors = [ "David Sawatzke <d-git@sawatzke.dev>" ]
+edition = "2021"
+
+[dependencies]
+litex-pac = { path = "../litex-pac", features = ["rt"]}
+riscv-rt = "0.13.0"
+litex-hal = {git = "https://github.com/david-sawatzke/rust-litex-hal", rev="63cc9e8fede3359333692717785ed2166430e5a6"}
+embedded-hal = {version = "0.2.4", features = ["unproven"]}
+spi-memory = "0.2.0"
+nb = "1"
+riscv = "0.12"
+menu = "0.3"
+smoltcp = { version = "0.8", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-icmp", "socket-udp", "socket-tcp", "socket-dhcpv4"] }
+heapless = "0.7.5"
+
+[patch.crates-io]
+smoltcp = { path = "../smoltcp-0.8.0" }
+
+[profile.release]
+# It will be removed when converting to a binary
+debug = true
+
+# Improve code generation
+lto = true
+codegen-units = 1
+
+# Authoring loop. Full LTO with codegen-units=1 is the right shipping profile and
+# the wrong one to sit behind twenty times while tuning an effect, so this trades
+# a little code quality for compile time. Deploy with --release; iterate with
+# --profile dev-fast. Time both before trusting the tradeoff.
+[profile.dev-fast]
+inherits = "release"
+opt-level = 2
+lto = false
+codegen-units = 16
+debug = true
+
+[features]
+# The bitstream has an S-PWM output stage (icn1065_soc.Icn1065Display) rather
+# than the HUB75 bit-plane one, so the chip table CSRs exist. build.sh sets
+# this from the panel preset's driver.
+spwm = []

@@ -1,0 +1,194 @@
+# A station departure board, composed ON the card -- the program-mode version of
+# the rail boards marquee streams. Same palette, no frame ever received.
+#
+# THE PROGRAM IS GENERIC; THE HOST DECIDES WHAT IS ON IT. There is no
+# Metro-North, LIRR or Amtrak in this file and no page logic: the widgets read
+# `sys`, `hdr`, `foot` and twelve row values, and marquee pushes whichever board
+# should be showing. Nine pages of nine boards would be ~180 widgets each with a
+# `when` guard, to say something the host already knows.
+#
+# WHY FOUR ROWS AND NOT SIX. The destination column SCROLLS, and scrolling needs
+# a fixed-advance face (see `mono` below) whose line height at the size that
+# gives a power-of-two advance is 17px. Six rows of 17 plus a header and footer
+# is 132px on a 128px wall, and the seam rule below costs another gap. Four rows
+# is what actually fits once scrolling is a requirement rather than a wish.
+program: railboard
+display: {width: 128, height: 128, dynamic: [16, 102]}
+
+# `dynamic: [16, 102]` is the ROW BAND, and it is large ON PURPOSE.
+#
+# Rows outside it repaint only when a value arrives, which is what makes a
+# static board nearly free. A SCROLLING row is different: its content is a
+# function of `ctx.frame`, so it must be redrawn every frame or it does not
+# move. That is the trade this program exists to measure -- 86 of 128 rows now
+# redraw at the frame rate, where the non-scrolling version redrew none of them
+# between pushes.
+#
+# The band also spans the seam gap (rows 50..67), which draws nothing. Splitting
+# it would need two bands and `dynamic` takes one; two rows of stores a frame is
+# cheaper than the machinery to avoid them.
+
+assets:
+  fonts:
+    # The header is proportional: it is one short string and never scrolls.
+    # Size 11, not 13, and it is measured: "METRO-NORTH" is the longest system
+    # name and runs 97px at 13 against the 86px the header has before the
+    # clock. At 11 it is 82px and clears it.
+    - {name: head, file: assets/fonts/DejaVuSans.ttf, size: 11}
+    # The ROWS are MONOSPACE, and that is a performance requirement rather than
+    # a style choice. `cover_scroll` finds the character under a pixel with one
+    # divide -- but only if the advance is fixed. In a proportional face it
+    # would have to walk the run: ~40 glyph lookups per pixel for a 40-character
+    # ticker, 16384 pixels a frame.
+    #
+    # SIZE 14 SPECIFICALLY. It is the size whose advance is 8 -- a power of two
+    # -- so panelc emits `adv_shift: 3` and the divide becomes a shift. 12 and
+    # 13 give advance 7 and 16 gives 9, all of which cost a real division in the
+    # hottest loop on the card. Bold is the project's own recommendation for
+    # ticker faces even though heavier is usually worse above 10px: a
+    # fixed-advance face is the constraint, and this is the one that ships.
+    - {name: mono, file: assets/fonts/DejaVuSansMono-Bold.ttf, size: 14}
+    # The same face two sizes down, for everything that does NOT scroll.
+    #
+    # Only the destination needs the power-of-two advance -- it is the only
+    # column `cover_scroll` touches. The time and countdown are static, so they
+    # can be as small as they are legible, and the width they give back all goes
+    # to the scrolling column: at size 14 the destination window was 6 cells, at
+    # 11 it is 8. A third wider, and nothing is lost.
+    #
+    # It also fixes the footer, which is not a column at all: "Northeast
+    # Corridor" is 18 characters, 144px at size 14 on a 128px wall, and was
+    # being clipped. At 11 it is 108px.
+    - {name: small, file: assets/fonts/DejaVuSansMono-Bold.ttf, size: 11}
+
+# The streamed boards' palette, exactly, so the two versions look like one sign.
+palette: |
+  match i {
+      16..=31 => { let c = (i - 16) as u32;
+                   rgb((0xe8 * c / 15) as u8, (0xed * c / 15) as u8, (0xf5 * c / 15) as u8) }
+      32..=47 => { let c = (i - 32) as u32;
+                   rgb((0xc9 * c / 15) as u8, (0xa8 * c / 15) as u8, (0x4c * c / 15) as u8) }
+      48..=63 => { let c = (i - 48) as u32;
+                   rgb((0x88 * c / 15) as u8, (0x99 * c / 15) as u8, (0xaa * c / 15) as u8) }
+      _ => crate::program::palette_default(i),
+  }
+
+# 16 of the 24 the value table holds. `set()` IGNORES a key once the table is
+# full rather than evicting, so going over would silently lose whichever key
+# went last -- one column simply blank with nothing to say why.
+#
+#   sys  the railroad     hdr  which view      foot  station or line
+#   hhmm the clock -- this card has no RTC and ctx.time_ms is UPTIME
+#   r<n>a time   r<n>b destination   r<n>c countdown
+values: [sys, hdr, foot, hhmm,
+         r0a, r0b, r0c, r1a, r1b, r1c, r2a, r2b, r2c, r3a, r3b, r3c]
+
+widgets:
+  # LAYOUT: this wall is two 128x64 modules STACKED, so y=64 is the seam. No
+  # line of type may cross it -- type spanning the seam reads as broken, not as
+  # tall. Two rows sit above, two below, and the gap is deliberate.
+  #
+  # COLUMNS. The scrolling one is measured in 8px cells because that is the
+  # advance `cover_scroll` shifts by; the static ones are just as wide as their
+  # text at size 11 (advance 6).
+  #
+  #     time  1..36   (5 x 7)    gutter 5
+  #     dest 41..97   (7 x 8)    gutter 5
+  #     cd  102..123  (3 x 7)    margin 5
+  #
+  # TAKE THE ADVANCE FROM THE GENERATED FONT, NOT FROM THE TTF. panelc
+  # rasterises at the exact size and rounds, and size 11 comes out at advance 7
+  # where measuring the outline suggests 6. Budgeting from the outline put the
+  # clock 3px off the right edge and butted the time against the destination
+  # again -- `grep fixed_advance src/assets.rs` is the number that counts.
+  #
+  # BOTH GUTTERS EXIST BECAUSE OF A BUG. A scrolling cell is full by definition,
+  # so with the columns butted together the wrapped tail of "North White Plains"
+  # appeared immediately after the time and the row read as "15:08ins".
+  #
+  # The time and countdown sit 2px LOWER than their band top so their baselines
+  # match the destination's: size 11 has ascent 11 where size 14 has 13, and
+  # `at` is the top of the band, not of the ink.
+  #
+  # Widget order is Z-ORDER and EARLIER IS ON TOP -- the opposite of CSS.
+
+  - value: {at: [2, 0],  font: head, color: brass, key: sys}
+  - value: {at: [92, 2], font: small, color: slate, key: hhmm}   # 5 x 7: 92..127
+
+  - value: {at: [1, 18], font: small, color: white, key: r0a}
+  - value: {at: [1, 35], font: small, color: white, key: r1a}
+  # -------- seam at y=64 --------
+  - value: {at: [1, 69], font: small, color: white, key: r2a}
+  - value: {at: [1, 86], font: small, color: white, key: r3a}
+
+  - value: {at: [102, 18], font: small, color: slate, key: r0c}
+  - value: {at: [102, 35], font: small, color: slate, key: r1c}
+  - value: {at: [102, 69], font: small, color: slate, key: r2c}
+  - value: {at: [102, 86], font: small, color: slate, key: r3c}
+
+  - value: {at: [2, 110], font: small, color: slate, key: foot}
+
+  - lambda:
+      # `row:` is the per-ROW prologue -- the hoisting the declarative widgets
+      # get automatically. A lambda is code panelc cannot analyse, so without
+      # this it pays ctx.val() (79 cycles) for every PIXEL to answer a question
+      # constant across the row. Only one row's destination can be on any given
+      # y, so this resolves the band once and reads ONE value, not four.
+      row: |
+        let (band, band_top) = match y {
+            16..=32 => (0usize, 16usize),
+            33..=49 => (1, 33),
+            67..=83 => (2, 67),
+            84..=100 => (3, 84),
+            _ => (9, 0),
+        };
+        let dest: &str = match band {
+            0 => ctx.val("r0b"), 1 => ctx.val("r1b"),
+            2 => ctx.val("r2b"), 3 => ctx.val("r3b"),
+            _ => "",
+        };
+        // Decided ONCE per row, not per pixel: does this name fit its column?
+        // `width()` walks the string, which is exactly the kind of work the
+        // per-pixel rule forbids -- and exactly what a row prologue is for.
+        let dest_w = if band != 9 { FONT_MONO.width(dest) } else { 0 };
+        let scrolls = dest_w > 56;
+        // SCROLL FROM THE CLOCK, NOT FROM THE FRAME COUNTER.
+        //
+        // `ctx.frame` is the obvious source and it is wrong here: the scroll
+        // itself is what drags the frame rate down (30 fps static, 13 fps with
+        // this band moving), so a per-frame step makes the speed a function of
+        // how much work the speed is causing. At `frame >> 1` the names crawled
+        // at ~6 px/s and a padded name took half a minute to come round -- the
+        // column read as empty for most of a page.
+        //
+        // `time_ms` is uptime in milliseconds and independent of all that:
+        // /40 is 25 px/s whatever the card is managing, and the divide is by a
+        // constant so the compiler strength-reduces it.
+        let vx0 = (ctx.time_ms / 40) as usize;
+        let stale = ctx.stale_ms() > 120_000;
+      px: |
+        // The destination, hard-clipped to its column. THIS is the clip a
+        // `value` widget does not have: it is guarded by its own string width,
+        // so a long name would run straight through the countdown.
+        if band != 9 && x >= 41 && x < 97 && !dest.is_empty() {
+            if scrolls {
+                // The name marches left and WRAPS -- the host pads it with a
+                // few trailing spaces so the wrap reads as a gap rather than as
+                // one word running into itself.
+                if let Some(c) = FONT_MONO.cover_scroll(dest, (x - 41) + vx0, y, band_top) {
+                    return Some(RAMP_BRASS + c);
+                }
+            } else if let Some(c) = FONT_MONO.cover_at(dest, x, y, 41, band_top) {
+                return Some(RAMP_BRASS + c);
+            }
+        }
+
+        // Told-you-so marker: the thing a streamed card structurally cannot do.
+        // Two minutes, because the Amtrak feed is pushed every two minutes by
+        // design and a shorter window would cry wolf on every Amtrak page.
+        if stale && y < 6 && x >= ctx.w - 6 { return Some(ALERT); }
+
+        // The seam. A 1px rule ON the boundary reads as intentional; without it
+        // the gap between the two modules reads as a fault.
+        if y == 63 && x >= 2 && x < ctx.w - 2 { return Some(RAMP_SLATE + 2); }
+        None

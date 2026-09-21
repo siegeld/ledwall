@@ -1,0 +1,27 @@
+[target.riscv32i-unknown-none-elf]
+runner = ".cargo/run.sh"
+rustflags = [
+  # +m: emit hardware MUL/DIV. The `lite` VexRiscv variant has ALWAYS had the M
+  # extension (LiteX reports -march=rv32i2p0_m for it), but the riscv32i target
+  # refuses to emit those instructions, so every multiply and divide became a
+  # SOFTWARE ROUTINE on a CPU that does them in one instruction. Per-pixel
+  # program code is full of both -- it was most of the frame budget.
+  #
+  # Done as a target-feature rather than by switching to the riscv32im target,
+  # which changes the atomics story the dependency tree relies on and does not
+  # build.
+  "-C", "target-feature=+m",
+  "-C", "link-arg=-Tregions.ld",
+  "-C", "link-arg=-Tmemory.x",
+  "-C", "link-arg=-Tlink.x",
+  "-C", "linker-plugin-lto",
+]
+
+
+[build]
+# rv32IM, not rv32I. The `lite` VexRiscv variant has ALWAYS had the M
+# extension (LiteX reports -march=rv32i2p0_m for it); building for plain
+# riscv32i meant every multiply and divide became a software routine on a
+# CPU that does them in one instruction. Per-pixel program code is full of
+# both, so this was most of the frame budget.
+target = "riscv32i-unknown-none-elf"

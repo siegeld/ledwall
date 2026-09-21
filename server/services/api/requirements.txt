@@ -1,0 +1,17 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+pydantic-settings==2.7.0
+SQLAlchemy==2.0.36
+alembic==1.14.0
+PyYAML==6.0.2
+pillow==11.1.0
+ldap3==2.9.1
+itsdangerous==2.2.0
+passlib==1.7.4
+websocket-client==1.8.0
+tftpy==0.8.6
+# Test runner. `make be-test` runs pytest INSIDE this image, so it has to be
+# here -- the target failed with "pytest: executable file not found" from the
+# repo being created until 2026-09-14.
+pytest==8.3.4
