@@ -1,0 +1,12 @@
+# A deliberately empty program: returns the background and nothing else.
+#
+# Not decoration -- it is the measurement that says whether a slow program is
+# slow because of what it draws, or because of the per-pixel machinery around
+# it (the indirect call, the framebuffer store, the iterator). Compare its frame
+# rate against a real program and the difference is the drawing.
+program: blank
+display: {width: 128, height: 128}
+values: []
+widgets:
+  - lambda: |
+      Some(BG)

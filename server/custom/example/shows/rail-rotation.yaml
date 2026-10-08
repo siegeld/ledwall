@@ -1,0 +1,217 @@
+# name: rail-rotation
+# description: All three rail boards in one rotation - Metro-North, LIRR, Amtrak
+#
+# Nine scenes, ten seconds each: a 90-second cycle giving each railroad half a
+# minute. Composed from the three single-system boards in this directory, which
+# stay useful on their own; this is what a wall shows when it has no particular
+# allegiance.
+#
+# TWO THINGS CHANGE when a board joins a rotation, and both are the same
+# problem -- a viewer arriving mid-cycle has no idea which railroad they are
+# looking at:
+#
+#   * the HEADER names the SYSTEM, not the scene. On its own board "DEPARTURES"
+#     is unambiguous; here it could be any of three. "METRO-NORTH" is 83px of
+#     the 93px header at size 10, "LIRR" 26 and "AMTRAK" 49 -- measured, and the
+#     reason the header is not "MNR DEPARTURES", which is 103px and clips.
+#   * the SCENE TYPE moves to the footer, left, with the station on the right.
+#
+# Everything else -- the rows layers, the column widths, the scroll settings --
+# is unchanged from the single-system boards. See doc/providers.md.
+display: {width: 128, height: 128, fps: 10, format: rgb}
+transition: {type: crossfade, duration: 0.4s}
+
+scenes:
+
+  - name: mnr-departures
+    duration: 10s
+    layers:
+      - {type: solid, color: "#05070d", box: [0, 0, 128, 128]}
+      - {type: gradient, start: "#12233d", end: "#05070d", box: [0, 0, 128, 15], angle: v}
+      - {type: text, text: "METRO-NORTH", box: [2, 2, 93, 12], size: 10, color: "#C9A84C"}
+      - {type: text, text: "{clock:%H:%M}", box: [97, 3, 29, 11], size: 9, align: right, color: "#8899aa"}
+
+      - type: rows
+        data: "mnr.harlem|departures"
+        box: [1, 17, 126, 90]
+        row_height: 15
+        size: 9
+        col_gap: 3
+        columns:
+          - {field: time,  w: 31, color: "#e6edf3"}
+          - {field: destination, w: 63, color: "#C9A84C", scroll: auto, speed: 16}
+          - {field: countdown, w: 26, color: "#8899aa", align: right}
+
+      - {type: text, text: "Departures", box: [2, 112, 57, 12], size: 8, color: "#55657a"}
+      - {type: text, text: "Grand Central", box: [63, 112, 63, 12], size: 8, align: right, color: "#55657a"}
+
+  - name: mnr-arrivals
+    duration: 10s
+    layers:
+      - {type: solid, color: "#05070d", box: [0, 0, 128, 128]}
+      - {type: gradient, start: "#12233d", end: "#05070d", box: [0, 0, 128, 15], angle: v}
+      - {type: text, text: "METRO-NORTH", box: [2, 2, 93, 12], size: 10, color: "#C9A84C"}
+      - {type: text, text: "{clock:%H:%M}", box: [97, 3, 29, 11], size: 9, align: right, color: "#8899aa"}
+
+      - type: rows
+        data: "mnr.harlem|arrivals"
+        box: [1, 17, 126, 90]
+        row_height: 15
+        size: 9
+        col_gap: 3
+        columns:
+          - {field: time,  w: 31, color: "#e6edf3"}
+          - {field: from, w: 63, color: "#C9A84C", scroll: auto, speed: 16}
+          - {field: countdown, w: 26, color: "#8899aa", align: right}
+
+      - {type: text, text: "Arrivals", box: [2, 112, 57, 12], size: 8, color: "#55657a"}
+      - {type: text, text: "Grand Central", box: [63, 112, 63, 12], size: 8, align: right, color: "#55657a"}
+
+  - name: mnr-on-the-line
+    duration: 10s
+    layers:
+      - {type: solid, color: "#05070d", box: [0, 0, 128, 128]}
+      - {type: gradient, start: "#12233d", end: "#05070d", box: [0, 0, 128, 15], angle: v}
+      - {type: text, text: "METRO-NORTH", box: [2, 2, 93, 12], size: 10, color: "#C9A84C"}
+      - {type: text, text: "{clock:%H:%M}", box: [97, 3, 29, 11], size: 9, align: right, color: "#8899aa"}
+
+      - type: rows
+        data: "mnr.harlem|trains"
+        box: [1, 17, 126, 90]
+        row_height: 15
+        size: 9
+        col_gap: 3
+        columns:
+          - {field: next_stop, w: 92, color: "#e6edf3", scroll: auto, speed: 16}
+          - {field: next_time, w: 29, color: "#C9A84C", align: right}
+
+      - {type: text, text: "Harlem line", box: [2, 111, 124, 13], size: 9, align: center, color: "#55657a"}
+
+  - name: lirr-departures
+    duration: 10s
+    layers:
+      - {type: solid, color: "#05070d", box: [0, 0, 128, 128]}
+      - {type: gradient, start: "#12233d", end: "#05070d", box: [0, 0, 128, 15], angle: v}
+      - {type: text, text: "LIRR", box: [2, 2, 93, 12], size: 10, color: "#C9A84C"}
+      - {type: text, text: "{clock:%H:%M}", box: [97, 3, 29, 11], size: 9, align: right, color: "#8899aa"}
+
+      - type: rows
+        data: "lirr.babylon-branch|departures"
+        box: [1, 17, 126, 90]
+        row_height: 15
+        size: 9
+        col_gap: 3
+        columns:
+          - {field: time,  w: 31, color: "#e6edf3"}
+          - {field: destination, w: 63, color: "#C9A84C", scroll: auto, speed: 16}
+          - {field: countdown, w: 26, color: "#8899aa", align: right}
+
+      - {type: text, text: "Departures", box: [2, 112, 57, 12], size: 8, color: "#55657a"}
+      - {type: text, text: "Penn Station", box: [63, 112, 63, 12], size: 8, align: right, color: "#55657a"}
+
+  - name: lirr-arrivals
+    duration: 10s
+    layers:
+      - {type: solid, color: "#05070d", box: [0, 0, 128, 128]}
+      - {type: gradient, start: "#12233d", end: "#05070d", box: [0, 0, 128, 15], angle: v}
+      - {type: text, text: "LIRR", box: [2, 2, 93, 12], size: 10, color: "#C9A84C"}
+      - {type: text, text: "{clock:%H:%M}", box: [97, 3, 29, 11], size: 9, align: right, color: "#8899aa"}
+
+      - type: rows
+        data: "lirr.babylon-branch|arrivals"
+        box: [1, 17, 126, 90]
+        row_height: 15
+        size: 9
+        col_gap: 3
+        columns:
+          - {field: time,  w: 31, color: "#e6edf3"}
+          - {field: from, w: 63, color: "#C9A84C", scroll: auto, speed: 16}
+          - {field: countdown, w: 26, color: "#8899aa", align: right}
+
+      - {type: text, text: "Arrivals", box: [2, 112, 57, 12], size: 8, color: "#55657a"}
+      - {type: text, text: "Penn Station", box: [63, 112, 63, 12], size: 8, align: right, color: "#55657a"}
+
+  - name: lirr-on-the-line
+    duration: 10s
+    layers:
+      - {type: solid, color: "#05070d", box: [0, 0, 128, 128]}
+      - {type: gradient, start: "#12233d", end: "#05070d", box: [0, 0, 128, 15], angle: v}
+      - {type: text, text: "LIRR", box: [2, 2, 93, 12], size: 10, color: "#C9A84C"}
+      - {type: text, text: "{clock:%H:%M}", box: [97, 3, 29, 11], size: 9, align: right, color: "#8899aa"}
+
+      - type: rows
+        data: "lirr.babylon-branch|trains"
+        box: [1, 17, 126, 90]
+        row_height: 15
+        size: 9
+        col_gap: 3
+        columns:
+          - {field: next_stop, w: 92, color: "#e6edf3", scroll: auto, speed: 16}
+          - {field: next_time, w: 29, color: "#C9A84C", align: right}
+
+      - {type: text, text: "Babylon Branch", box: [2, 111, 124, 13], size: 9, align: center, color: "#55657a"}
+
+  - name: amtrak-departures
+    duration: 10s
+    layers:
+      - {type: solid, color: "#05070d", box: [0, 0, 128, 128]}
+      - {type: gradient, start: "#12233d", end: "#05070d", box: [0, 0, 128, 15], angle: v}
+      - {type: text, text: "AMTRAK", box: [2, 2, 93, 12], size: 10, color: "#C9A84C"}
+      - {type: text, text: "{clock:%H:%M}", box: [97, 3, 29, 11], size: 9, align: right, color: "#8899aa"}
+
+      - type: rows
+        data: "amtrak.nyp-bos|departures"
+        box: [1, 17, 126, 90]
+        row_height: 15
+        size: 9
+        col_gap: 3
+        columns:
+          - {field: time,  w: 31, color: "#e6edf3"}
+          - {field: service, w: 63, color: "#C9A84C", scroll: auto, speed: 16}
+          - {field: countdown, w: 26, color: "#8899aa", align: right}
+
+      - {type: text, text: "To Boston", box: [2, 112, 57, 12], size: 8, color: "#55657a"}
+      - {type: text, text: "Penn Station", box: [63, 112, 63, 12], size: 8, align: right, color: "#55657a"}
+
+  - name: amtrak-arrivals
+    duration: 10s
+    layers:
+      - {type: solid, color: "#05070d", box: [0, 0, 128, 128]}
+      - {type: gradient, start: "#12233d", end: "#05070d", box: [0, 0, 128, 15], angle: v}
+      - {type: text, text: "AMTRAK", box: [2, 2, 93, 12], size: 10, color: "#C9A84C"}
+      - {type: text, text: "{clock:%H:%M}", box: [97, 3, 29, 11], size: 9, align: right, color: "#8899aa"}
+
+      - type: rows
+        data: "amtrak.nyp-bos|arrivals"
+        box: [1, 17, 126, 90]
+        row_height: 15
+        size: 9
+        col_gap: 3
+        columns:
+          - {field: time,  w: 31, color: "#e6edf3"}
+          - {field: service, w: 63, color: "#C9A84C", scroll: auto, speed: 16}
+          - {field: countdown, w: 26, color: "#8899aa", align: right}
+
+      - {type: text, text: "From Boston", box: [2, 112, 57, 12], size: 8, color: "#55657a"}
+      - {type: text, text: "Penn Station", box: [63, 112, 63, 12], size: 8, align: right, color: "#55657a"}
+
+  - name: amtrak-on-the-line
+    duration: 10s
+    layers:
+      - {type: solid, color: "#05070d", box: [0, 0, 128, 128]}
+      - {type: gradient, start: "#12233d", end: "#05070d", box: [0, 0, 128, 15], angle: v}
+      - {type: text, text: "AMTRAK", box: [2, 2, 93, 12], size: 10, color: "#C9A84C"}
+      - {type: text, text: "{clock:%H:%M}", box: [97, 3, 29, 11], size: 9, align: right, color: "#8899aa"}
+
+      - type: rows
+        data: "amtrak.nyp-bos|trains"
+        box: [1, 17, 126, 90]
+        row_height: 15
+        size: 9
+        col_gap: 3
+        columns:
+          - {field: train, w: 24, size: 8, color: "#8899aa"}
+          - {field: next_stop, w: 67, color: "#e6edf3", scroll: auto, speed: 16}
+          - {field: next_time, w: 29, color: "#C9A84C", align: right}
+
+      - {type: text, text: "Northeast Corridor", box: [2, 111, 124, 13], size: 9, align: center, color: "#55657a"}

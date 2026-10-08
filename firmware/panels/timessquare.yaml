@@ -1,0 +1,153 @@
+# TIMES SQUARE. Everything at once, full canvas, every frame.
+#
+# The other demo is about writing as little as possible; this one is the
+# opposite exercise -- 16384 pixels composed from scratch every frame, with
+# plasma, a spinning sprite, sparkle, a chasing border, two live tapes and a
+# palette that never stops moving. If this renders correctly, the whole system
+# does.
+#
+# WHAT MAKES IT AFFORDABLE. The panel is a 40 MHz VexRiscv with NO D-CACHE, so
+# a memory read costs about what a write does, and every per-pixel decision
+# happens 16384 times a frame. (It does have the M extension -- see
+# docs/BENCHMARKS.md -- so multiply and divide are instructions, not software
+# routines. A divide is still iterative where a shift is not.) Three rules
+# follow, and this file is mostly an argument for them:
+#
+#   1. REJECT BEFORE YOU COMPUTE. The spinning star used to do a rotation, a
+#      glyph lookup and a sprite read for all 16384 pixels to answer "no" for
+#      92% of them. `sprite_rotated` now tests a bounding disc first.
+#   2. NO DIVIDES IN THE PIXEL LOOP. `plasma` was four divides a pixel; it is
+#      shifts and three table lookups now.
+#   3. HOIST WHAT DEPENDS ONLY ON THE ROW. `row:` runs once per row and its
+#      locals are visible in `px:` -- so the plasma's y term, the star's angle
+#      and every band test are computed 128 times a frame, not 16384.
+#
+# Note what "live" costs: about 20 bytes every ten seconds. The panel composes
+# every pixel itself, so pull marquee's plug and the sign keeps running and
+# starts saying the data is old, rather than freezing on a frame that still
+# looks correct.
+program: timessquare
+display: {width: 128, height: 128}
+
+# Only rows where EVERYTHING translates together may be declared here. The
+# plasma is deliberately kept out of these bands: shifting a band that also
+# contains an independently animating background would drag it along with the
+# letters.
+scroll:
+  - {band: [6, 40], speed: 1, dir: left}
+  - {band: [90, 124], speed: 1, dir: right}
+
+assets:
+  fonts:
+    - {name: tick, file: assets/fonts/DejaVuSansMono-Bold.ttf, size: 26}
+  icons:
+    - {name: star, file: assets/icons/star.svg, size: 26}
+
+values: [temp, cond, doors, windows, garage, unlocked]
+
+# Colour comes from here, not from the pixels. Rotating the white ramp sweeps
+# hue through every anti-aliased thing on the panel at once -- the tapes and the
+# star -- for 256 words a frame, and the cost does not grow with the wall.
+palette: |
+  let f = ctx.frame as usize;
+  match i {
+      0 => rgb(0, 0, 0),
+      1..=3 => rgb(0, 0, 0),
+      16..=31 => {
+          let cov = (i - 16) as u32;
+          let t = ((i - 16) * 6 + f * 4) & 127;
+          let seg = t * 6 / 128;
+          let k = (((t * 6) % 128) * 255 / 128) as u32;
+          let (r, g, b) = match seg {
+              0 => (255, k, 0),
+              1 => (255 - k, 255, 0),
+              2 => (0, 255, k),
+              3 => (0, 255 - k, 255),
+              4 => (k, 0, 255),
+              _ => (255, 0, 255 - k),
+          };
+          rgb((r * cov / 15) as u8, (g * cov / 15) as u8, (b * cov / 15) as u8)
+      }
+      48..=63 => {
+          let d = (i - 48) as u32;
+          let pulse = 40 + (sin64(f / 3 + (i - 48) * 2) + 256) as u32 * 60 / 512;
+          rgb((pulse * d / 40) as u8, (pulse * d / 26) as u8, (pulse * d / 18) as u8)
+      }
+      _ => crate::program::palette_default(i),
+  }
+
+widgets:
+  # Order is z-order: first match wins, so this reads top layer down.
+  - lambda:
+      row: |
+        // Everything here happens 128 times a frame instead of 16384.
+        let f = ctx.frame as usize;
+        let plasma_row = PlasmaRow::new(ctx, y);
+        let spin = f / 2;
+        let tape_top = y >= 6 && y < 40;
+        let tape_bot = y >= 90 && y < 124;
+        let star_row = y.abs_diff(ctx.h / 2) <= 21;
+        // The border and the stale marker only ever ink the outside. Deciding
+        // that once per row means ~14000 pixels a frame stop making two calls
+        // apiece to be told "not here".
+        let edge_row = y < 3 || y >= ctx.h - 3;
+        let stale_row = y < 6 && ctx.stale_ms() > 30_000;
+        let ground_top = RAMP_SLATE + ((y.saturating_sub(6)) * 15 / 34) as u8;
+        let ground_bot = RAMP_SLATE + ((123usize.saturating_sub(y)) * 15 / 34) as u8;
+
+      px: |
+        fn top(ctx: &Ctx, m: &mut Msg) {
+            use core::fmt::Write;
+            let _ = write!(
+                m, "*** DASHBOARD NEW YORK *** OUTSIDE {:>3.3}F *** {:<11.11} *** ",
+                ctx.val("temp"), ctx.val("cond"),
+            );
+            // 59 characters into a 64 period. Padding sets the PERIOD, so it
+            // must be the next power of two ABOVE the text, not far above it:
+            // pad far past and the padding is what you see. This tape was 62
+            // characters padded to 128, which is 66 blank ones -- the tape read
+            // as empty most of the time.
+            m.pad_to(64);
+        }
+        fn bot(ctx: &Ctx, m: &mut Msg) {
+            use core::fmt::Write;
+            let _ = write!(
+                m, "+++ DOORS {:>2.2} +++ WINDOWS {:>2.2} +++ GARAGE {:>2.2} +++ UNLOCKED {:>2.2} +++ ",
+                ctx.val("doors"), ctx.val("windows"), ctx.val("garage"), ctx.val("unlocked"),
+            );
+            m.pad_to(64);
+        }
+
+        // The tapes are SHIFTED, not redrawn, so they may contain only the text
+        // and a ground that depends on y alone -- no sparkle, no plasma, or the
+        // shift would smear it along with the letters. A shift moves pixels
+        // along a row, so anything constant in x survives untouched: that is
+        // how a shifted tape still gets a moving background, since the ground
+        // is a palette INDEX and the palette hook animates it for no writes.
+        if tape_top {
+            if let Some(c) = scroll_message(ctx, &FONT_TICK, top, x, y, 8, 1, RAMP_WHITE) {
+                return Some(c);
+            }
+            return Some(ground_top);
+        }
+        if tape_bot {
+            if let Some(c) = scroll_message_rev(ctx, &FONT_TICK, bot, x, y, 92, 1, RAMP_WHITE) {
+                return Some(c);
+            }
+            return Some(ground_bot);
+        }
+
+        // The thing a streamed panel structurally cannot do: when the host dies
+        // it keeps showing a frame that looks perfectly correct. This says so.
+        if stale_row && x >= ctx.w - 6 { return Some(ALERT); }
+
+        if let Some(c) = sparkle(ctx, x, y, 17, RAMP_WHITE) { return Some(c); }
+        if edge_row || x < 3 || x >= ctx.w - 3 {
+            if let Some(c) = border_chase(ctx, x, y, 3, 3) { return Some(c); }
+        }
+        if star_row {
+            if let Some(c) = sprite_rotated(&ICON_STAR, x, y, ctx.w / 2, ctx.h / 2, spin, RAMP_WHITE) {
+                return Some(c);
+            }
+        }
+        Some(plasma_row.at(x))

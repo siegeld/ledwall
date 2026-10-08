@@ -1,0 +1,24 @@
+@tailwind base; @tailwind components; @tailwind utilities;
+
+:root {
+  --bg: 248 250 252; --surface: 255 255 255; --raised: 241 245 249;
+  --border: 226 232 240; --fg: 15 23 42; --muted: 100 116 139; --faint: 148 163 184;
+  --accent: 37 99 235; --accent-fg: 255 255 255;
+  /* Status colours are colour-blind-safe by design: blue for good and violet
+     for bad, never green/red, and always paired with an icon. */
+  --good: 37 99 235; --warn: 245 158 11; --bad: 124 58 237;
+}
+.dark {
+  --bg: 2 6 23; --surface: 15 23 42; --raised: 30 41 59;
+  --border: 30 41 59; --fg: 241 245 249; --muted: 148 163 184; --faint: 100 116 139;
+  --accent: 37 99 235; --accent-fg: 255 255 255;
+  --good: 59 130 246; --warn: 245 158 11; --bad: 139 92 246;
+}
+body { @apply bg-bg text-fg; }
+@layer components {
+  .card { @apply rounded-xl border border-border bg-surface p-4; }
+  .tile-label { @apply text-xs uppercase tracking-wide text-muted; }
+  .btn { @apply rounded-lg bg-raised px-3 py-1.5 text-sm hover:brightness-110 disabled:opacity-50 transition; }
+  .btn-primary { @apply rounded-lg bg-accent text-accent-fg px-3 py-1.5 text-sm hover:brightness-110 disabled:opacity-50 transition; }
+  .input { @apply w-full rounded-lg border border-border bg-raised px-3 py-1.5 text-sm outline-none focus:border-accent; }
+}

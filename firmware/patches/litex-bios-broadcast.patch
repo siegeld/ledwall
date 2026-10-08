@@ -1,0 +1,13 @@
+--- a/litex/soc/software/bios/boot.c
++++ b/litex/soc/software/bios/boot.c
+@@ -325,6 +325,10 @@
+ 	ip = IPTOINT(remote_ip[0], remote_ip[1], remote_ip[2], remote_ip[3]);
+ 	udp_start(macadr, IPTOINT(local_ip[0], local_ip[1], local_ip[2], local_ip[3]));
+
++#ifdef ETH_UDP_BROADCAST
++	udp_set_broadcast();
++#endif
++
+ 	if (filename) {
+ 		printf("Booting from %s (JSON)...\n", filename);
+ 		netboot_from_json(filename, ip, TFTP_SERVER_PORT);

@@ -1,0 +1,229 @@
+# THE TAPE. Times Square, and an argument about what animation costs.
+#
+# Everything on this sign moves: the bulbs chase round the frame, colour runs
+# along the letters of both tapes, the tape grounds breathe, the middle is a
+# rainbow field flowing diagonally, and the clock cycles hue. Watch it for ten
+# seconds and it never repeats.
+#
+# Now the point. Between value pushes this program writes ONE COLUMN PER TAPE
+# ROW and nothing else -- about 68 pixels a frame out of 16384. All of that
+# motion is in the PALETTE: 256 words a frame, and the cost does not grow with
+# the wall, so a nine-panel video wall would cycle for exactly the same price.
+#
+# That is the whole case for `mode: program`. A streamed panel must send every
+# pixel of every frame to do any of this; here the sign composes itself, and if
+# marquee dies it keeps running and starts saying the data is stale instead of
+# freezing on a frame that still looks correct.
+#
+#   * SCROLL BANDS shift what is already on the glass and ask the program only
+#     for the column each shift uncovers -- which is what buys one-pixel steps,
+#     and one-pixel steps are what "smooth" means.
+#   * `dynamic` is EMPTY, and that is deliberate. Scroll bands animate
+#     independently of it: `program_tick` shifts them first and then renders
+#     only the NON-scroll rows inside `dynamic`. So [0, 0] says "nothing
+#     outside the tapes changes every frame" -- the middle is painted when a
+#     value arrives and then animated entirely in the palette. Declaring
+#     [8, 122] instead, to "cover both tapes", repaints the 46 rows between
+#     them every frame for nothing: 10.7 fps against 29.4.
+#   * Animating the palette was UNSAFE until colorlight v2.7.0 -- it was single
+#     buffered under a gateware-swapped framebuffer, so it tore (RB-5516). Two
+#     banks now, which is what makes this design possible at all.
+program: ticker
+display: {width: 128, height: 128, dynamic: [0, 0]}
+
+scroll:
+  - {band: [8, 42], speed: 1, dir: left}
+  - {band: [88, 122], speed: 1, dir: right}
+
+assets:
+  fonts:
+    - {name: tick, file: assets/fonts/DejaVuSansMono-Bold.ttf, size: 26}
+    - {name: label, file: assets/fonts/DejaVuSans.ttf, size: 13}
+
+values: [temp, cond, hhmm, power]
+
+# EVERY moving thing on this panel is here. Five independent animations, 256
+# words a frame between them.
+palette: |
+  let f = ctx.frame as usize;
+  // THE BEAT. ~8 seconds at 30 fps: a long calm stretch, then a two-second
+  // blast. Derived from the frame counter, so it needs no state and survives a
+  // program restart mid-cycle.
+  let beat = f % 240;
+  let blast = beat >= 180;
+  // How hard the blast hits. NOT 255: a HUB75 module at this pitch is painfully
+  // bright at full scale, and the gateware applies gamma downstream so the top
+  // of the range is where most of the perceived output lives. ~60% reads as a
+  // bright flash across a room without being unpleasant to sit near.
+  const HOT: u32 = 150;
+  // And it strobes on one frame in four rather than two, so it reads as a
+  // flicker rather than a stutter.
+  let strobe = f & 3 == 0;
+  // Six-segment hue wheel, 0..127 -> rgb. No float and no divide beyond the
+  // constants; this runs 256 times a frame, not once per pixel.
+  fn wheel(t: usize) -> (u32, u32, u32) {
+      let t = t & 127;
+      let seg = t * 6 / 128;
+      let k = (((t * 6) % 128) * 255 / 128) as u32;
+      match seg {
+          0 => (255, k, 0),
+          1 => (255 - k, 255, 0),
+          2 => (0, 255, k),
+          3 => (0, 255 - k, 255),
+          4 => (k, 0, 255),
+          _ => (255, 0, 255 - k),
+      }
+  }
+  match i {
+      // 16..31 -- tape text AND the clock. Hue runs ALONG the run, so the
+      // colour travels through the letters while the letters travel past.
+      16..=31 => {
+          let cov = (i - 16) as u32;
+          // During the blast the type goes hard white and strobes with the
+          // field, so the whole sign pulses as one thing.
+          if blast && strobe {
+              // The type stays a little hotter than the rest -- it is what the
+              // eye lands on -- but still well under full scale.
+              let w = HOT + 40;
+              rgb((w * cov / 15) as u8, (w * cov / 15) as u8, (w * cov / 15) as u8)
+          } else {
+              let (r, g, b) = wheel((i - 16) * 5 + f * if blast { 12 } else { 3 });
+              rgb((r * cov / 15) as u8, (g * cov / 15) as u8, (b * cov / 15) as u8)
+          }
+      }
+      // 32..47 -- the temperature, pulsing white-hot to amber.
+      32..=47 => {
+          let cov = (i - 32) as u32;
+          let beat = (176 + sin64(f / 2) * 80 / 256) as u32;
+          rgb((beat * cov / 15) as u8, ((beat * 3 / 4) * cov / 15) as u8, ((beat / 3) * cov / 15) as u8)
+      }
+      // 48..63 -- the tape grounds, breathing. The pixels holding these
+      // indices are never rewritten, so this motion is free.
+      48..=63 => {
+          let d = (i - 48) as u32;
+          // The grounds fire with everything else, so the blast is the WHOLE
+          // sign going off rather than a bright patch in the middle of it.
+          if blast && strobe {
+              rgb((HOT * d / 15) as u8, (HOT * d / 15) as u8, (HOT * d / 15) as u8)
+          } else {
+              let pulse = 30 + (sin64(f / 4 + (i - 48)) + 256) as u32 * 50 / 512;
+              rgb((pulse * d / 46) as u8, (pulse * d / 30) as u8, (pulse * d / 20) as u8)
+          }
+      }
+      // 64..191 -- the rings. THE ATTRACT SEQUENCE LIVES HERE.
+      //
+      // An eight-second beat: seven seconds of rings rushing outward under the
+      // clock, then a two-second BLAST where they accelerate, saturate and
+      // strobe. None of it writes a pixel.
+      64..=191 => {
+          let t = i - 64;
+          if blast {
+              // Rings rush four times faster and run at full brightness, with
+              // the whole field flashing to white on alternate frames.
+              let (r, g, b) = wheel(t + f * 8);
+              if strobe { rgb(HOT as u8, HOT as u8, HOT as u8) }
+              else { rgb((r * 3 / 5) as u8, (g * 3 / 5) as u8, (b * 3 / 5) as u8) }
+          } else {
+              // Held well down the rest of the time so the clock reads.
+              let (r, g, b) = wheel(t + f * 2);
+              let k = 4 + (sin64(f / 6) + 256) as u32 * 4 / 512;
+              rgb((r / k) as u8, (g / k) as u8, (b / k) as u8)
+          }
+      }
+      // 208..223 -- theatre bulbs. A bright group of three chases round the
+      // sixteen phases; the rest glow dim, and the whole ring drifts in hue.
+      208..=223 => {
+          // Chasing normally; during the blast every bulb fires at once, on
+          // alternate frames, like a theatre frame being flashed.
+          let ph = (i - 208 + f / if blast { 1 } else { 2 }) & 15;
+          let (r, g, b) = wheel((i - 208) * 8 + f * 4);
+          if blast {
+              if strobe { rgb(HOT as u8, HOT as u8, HOT as u8) }
+              else { rgb((r * 3 / 5) as u8, (g * 3 / 5) as u8, (b * 3 / 5) as u8) }
+          }
+          // The lit bulbs ring the whole frame and are on all the time, so
+          // they are what the room actually sees. Held to ~70% -- at full
+          // scale they were the brightest thing on the panel by a distance.
+          else if ph < 3 { rgb((r * 7 / 10) as u8, (g * 7 / 10) as u8, (b * 7 / 10) as u8) }
+          else { rgb((r / 7) as u8, (g / 7) as u8, (b / 7) as u8) }
+      }
+      _ => crate::program::palette_default(i),
+  }
+
+widgets:
+  # Order is z-order, first match wins -- so the type goes above the field.
+  #
+  # SPACING. `at` is the top of the BAND, not the ink. Measured: the 26px mono
+  # face inks +6..+24 from the band top, the 13px sans +4..+12. The clock used
+  # to sit at 48 and the temperature at 66, which put clock ink at 54..72 and
+  # temperature ink at 70..78 -- three rows of overlap, and the two strings
+  # printed through each other.
+  - value: {at: [center, 44], font: tick, color: white, key: hhmm}          # ink 50..68
+  - value: {at: [center, 72], font: label, color: brass, key: temp,
+            prefix: "OUTSIDE ", suffix: "°"}                                # ink 76..84
+
+  - lambda:
+      # Hoisted per row: the band tests, and the ring's row component.
+      row: |
+        let top_row = y >= 8 && y < 42;
+        let bot_row = y >= 88 && y < 122;
+        let ring_row = y < 3 || y >= ctx.h - 3;
+        let ybulb = y >> 3;
+
+      px: |
+        // Built only when a value actually LANDS -- about once every ten
+        // seconds, not once per frame. Padded to a power-of-two length so
+        // cover_scroll's message index is a mask rather than a third software
+        // division; riscv32i has no divide instruction.
+        fn top(ctx: &Ctx, m: &mut Msg) {
+            use core::fmt::Write;
+            // Padding is for a CONSTANT PERIOD, not for length: cover_scroll
+            // wraps modulo len*advance, so a message that changed length would
+            // make the tape jump. But pad far past the text and the padding is
+            // what you see -- 38 characters padded to 64 left 26 spaces, a
+            // 416px gap in a 1024px period, so the tape read as empty for
+            // fifteen seconds out of every thirty-six. Fill the period.
+            let _ = write!(m, "*** DASHBOARD NEW YORK *** OUTSIDE {:>3.3}F *** {:<11.11} *** ",
+                           ctx.val("temp"), ctx.val("cond"));
+            m.pad_to(64);
+        }
+        fn bot(ctx: &Ctx, m: &mut Msg) {
+            use core::fmt::Write;
+            let _ = write!(m, "+++ HOUSE LOAD {:>6.6} kW +++ THE TIME IS {:>5.5} +++ ON AIR +++ ",
+                           ctx.val("power"), ctx.val("hhmm"));
+            m.pad_to(64);
+        }
+
+        if top_row {
+            if let Some(c) = scroll_message(ctx, &FONT_TICK, top, x, y, 10, 1, RAMP_WHITE) {
+                return Some(c);
+            }
+            return Some(RAMP_SLATE + ((y - 8) * 15 / 34) as u8);
+        }
+        if bot_row {
+            if let Some(c) = scroll_message_rev(ctx, &FONT_TICK, bot, x, y, 90, 1, RAMP_WHITE) {
+                return Some(c);
+            }
+            return Some(RAMP_SLATE + ((121 - y) * 15 / 34) as u8);
+        }
+
+        // The bulb ring. A pixel takes the index of the BULB it belongs to and
+        // the palette does the chasing -- so the frame is alive for no writes.
+        if ring_row || x < 3 || x >= ctx.w - 3 {
+            return Some(RAMP_BULB + (((x >> 3) + ybulb) & 15) as u8);
+        }
+
+        // THE ZOOM, and it costs nothing.
+        //
+        // Each pixel takes the index of the RING it sits on -- Chebyshev
+        // distance from the centre, which is two abs_diffs and a max. A squared
+        // radius would be two multiplies and a compare per pixel; this is three
+        // single-cycle operations and looks better here anyway. Rotating those entries in
+        // the palette makes the rings rush outward, and dropping their
+        // brightness together makes the whole sign flash.
+        //
+        // So the attract sequence -- rings zooming, colour cycling, the big
+        // strobe every eight seconds -- is 256 words a frame and NOT ONE pixel
+        // write. That is the argument for program mode in one line.
+        let d = x.abs_diff(ctx.w / 2).max(y.abs_diff(ctx.h / 2));
+        Some(RAINBOW + ((d << 2) & 127) as u8)
