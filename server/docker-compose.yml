@@ -1,0 +1,46 @@
+services:
+  api:
+    build: { context: ., dockerfile: services/api/Dockerfile }
+    image: marquee-api:${TAG:-latest}
+    restart: unless-stopped
+    # Alembic owns the schema, and it must run before anything opens a session.
+    # The player used to create missing tables itself, which raced the migration
+    # and won -- see the comment in services/player/main.py.
+    command: ["sh", "-c", "alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port 8000"]
+    env_file: [.env]
+    volumes:
+      - ./VERSION:/app/VERSION:ro
+      - ./data:/data
+      # Shows live in files under custom/ and are imported into the DB. Mounted
+      # read-write because `make shows-export` writes back out to them.
+      - ./custom:/custom
+      - ./scripts:/app/scripts:ro
+      - /share/homemovies:/share/homemovies:ro
+      - /share/movies:/share/movies:ro
+    ports: ["8410:8000"]
+
+  player:
+    build: { context: ., dockerfile: services/player/Dockerfile }
+    image: marquee-player:${TAG:-latest}
+    restart: unless-stopped
+    env_file: [.env]
+    # host networking: the pixel stream is ~1250+ UDP pkt/s to panels on the
+    # local segment, and TFTP boot replies must come from the host address the
+    # panel's BIOS was pointed at. NAT would break both.
+    network_mode: host
+    volumes:
+      - ./VERSION:/app/VERSION:ro
+      - ./data:/data
+      # Data providers are loaded from custom/<site>/providers/ -- read-only
+      # here because the player only ever imports them, where the api also
+      # writes shows back out under custom/.
+      - ./custom:/custom:ro
+      - /share/homemovies:/share/homemovies:ro
+      - /share/movies:/share/movies:ro
+
+  frontend:
+    build: { context: ., dockerfile: services/frontend/Dockerfile }
+    image: marquee-web:${TAG:-latest}
+    restart: unless-stopped
+    ports: ["8411:3000"]
+    depends_on: [api]

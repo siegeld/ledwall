@@ -1,0 +1,401 @@
+--- a/litex/soc/software/libliteeth/udp.h
++++ b/litex/soc/software/libliteeth/udp.h
+@@ -27,6 +27,16 @@
+ #ifdef ETH_UDP_BROADCAST
+ void udp_set_broadcast_callback(udp_callback callback);
+ void udp_set_broadcast(void);
++
++/* What a DHCP lease told us. `boot_server` is option 66 when the server sent
++ * one, else the BOOTP siaddr field, else 0. Windows DHCP leaves siaddr zero
++ * and only serves 66, which is why 66 is preferred rather than the other way
++ * round. */
++struct udp_dhcp_lease {
++	uint32_t local_ip;
++	uint32_t boot_server;
++};
++int udp_dhcp_request(const uint8_t *macaddr, struct udp_dhcp_lease *out);
+ #endif /* ETH_UDP_BROADCAST */
+ void udp_service(void);
+ 
+--- a/litex/soc/software/libliteeth/udp.c
++++ b/litex/soc/software/libliteeth/udp.c
+@@ -595,6 +595,247 @@
+ 	}
+ }
+ 
++/*
++ * Minimal DHCP client, for ONE job: learning where to TFTP the boot image
++ * from, so the server's address is not compiled into every bitstream.
++ *
++ * Prefers option 66 (Boot Server Host Name) over the BOOTP siaddr field.
++ * That order is not arbitrary -- this estate's DHCP is Windows Server, which
++ * leaves siaddr zero and only serves 66/67. siaddr is kept as a fallback
++ * because ISC dhcpd and dnsmasq populate it from `next-server`.
++ *
++ * Both replies are asked for as BROADCAST (flags bit 15). We have no address
++ * when we ask, so a unicast reply would have to be sent to an IP we do not
++ * own yet; the broadcast path is the one process_udp() can actually deliver
++ * to us via the bx_callback.
++ *
++ * Deliberately NOT a general DHCP implementation: no lease renewal, no ARP
++ * probe, no decline, no T1/T2. The lease is used for the few hundred
++ * milliseconds netboot takes and then abandoned -- the Rust firmware brings
++ * up its own stack and does its own DHCP with the same MAC, so the server
++ * hands it the same address.
++ */
++#ifdef ETH_UDP_BROADCAST
++
++#define DHCP_CLIENT_PORT 68
++#define DHCP_SERVER_PORT 67
++#define DHCP_MAGIC       0x63825363
++
++#define DHCP_DISCOVER 1
++#define DHCP_OFFER    2
++#define DHCP_REQUEST  3
++#define DHCP_ACK      5
++
++#define DHCP_OPT_PAD            0
++#define DHCP_OPT_MESSAGE_TYPE  53
++#define DHCP_OPT_REQUESTED_IP  50
++#define DHCP_OPT_SERVER_ID     54
++#define DHCP_OPT_PARAM_LIST    55
++#define DHCP_OPT_TFTP_SERVER   66
++#define DHCP_OPT_END          255
++
++/* A BOOTP message is 236 bytes of fixed header, then the magic cookie, then
++ * options. Sent length is padded to 300 so relay agents that assume a
++ * minimum BOOTP size stay happy. */
++struct dhcp_frame {
++	uint8_t  op, htype, hlen, hops;
++	uint32_t xid;
++	uint16_t secs, flags;
++	uint32_t ciaddr, yiaddr, siaddr, giaddr;
++	uint8_t  chaddr[16];
++	uint8_t  sname[64];
++	uint8_t  file[128];
++	uint32_t magic;
++	uint8_t  options[4];
++} __attribute__((packed));
++
++#define DHCP_SEND_LEN 300
++
++static uint32_t dhcp_xid;
++static int      dhcp_got;          /* message type of the last accepted reply */
++static uint32_t dhcp_yiaddr;
++static uint32_t dhcp_siaddr;
++static uint32_t dhcp_server_id;
++static uint32_t dhcp_opt66;
++
++/* "192.168.1.10" -> host-order uint32. Returns 0 on anything unparseable, which
++ * is also the "no answer" value -- a boot server at 0.0.0.0 is meaningless
++ * either way, so one sentinel covers both. */
++static uint32_t dhcp_parse_dotted(const uint8_t *s, int len)
++{
++	uint32_t ip = 0, oct = 0;
++	int i, digits = 0, parts = 0;
++
++	for(i=0;i<len;i++) {
++		if(s[i] >= '0' && s[i] <= '9') {
++			oct = oct*10 + (s[i] - '0');
++			if(oct > 255) return 0;
++			digits++;
++		} else if(s[i] == '.') {
++			if(!digits || parts == 3) return 0;
++			ip = (ip << 8) | oct;
++			oct = 0; digits = 0; parts++;
++		} else if(s[i] == 0) {
++			break;
++		} else {
++			return 0;   /* a hostname: the BIOS has no resolver */
++		}
++	}
++	if(!digits || parts != 3) return 0;
++	return (ip << 8) | oct;
++}
++
++static void dhcp_rx(uint32_t src_ip, uint16_t src_port, uint16_t dst_port,
++		    void *data, uint32_t length)
++{
++	struct dhcp_frame *f = (struct dhcp_frame *)data;
++	uint8_t *o, *end;
++	int type = 0;
++	uint32_t o66 = 0, sid = 0;
++
++	if(dst_port != DHCP_CLIENT_PORT || src_port != DHCP_SERVER_PORT) return;
++	if(length < 240) return;
++	if(f->op != 2) return;
++	if(f->xid != dhcp_xid) return;
++	if(ntohl(f->magic) != DHCP_MAGIC) return;
++
++	o   = (uint8_t *)data + 240;
++	end = (uint8_t *)data + length;
++	while(o < end) {
++		uint8_t code = *o++;
++		uint8_t olen;
++		if(code == DHCP_OPT_END) break;
++		if(code == DHCP_OPT_PAD) continue;
++		if(o >= end) break;
++		olen = *o++;
++		if(o + olen > end) break;           /* truncated: stop, do not walk off */
++		switch(code) {
++		case DHCP_OPT_MESSAGE_TYPE:
++			if(olen == 1) type = o[0];
++			break;
++		case DHCP_OPT_SERVER_ID:
++			if(olen == 4) sid = (o[0]<<24)|(o[1]<<16)|(o[2]<<8)|o[3];
++			break;
++		case DHCP_OPT_TFTP_SERVER:
++			o66 = dhcp_parse_dotted(o, olen);
++			break;
++		}
++		o += olen;
++	}
++
++	if(type != DHCP_OFFER && type != DHCP_ACK) return;
++
++	dhcp_yiaddr    = ntohl(f->yiaddr);
++	dhcp_siaddr    = ntohl(f->siaddr);
++	if(sid) dhcp_server_id = sid;
++	if(o66) dhcp_opt66     = o66;
++	dhcp_got = type;
++}
++
++static void dhcp_send(const uint8_t *macaddr, int type)
++{
++	struct dhcp_frame *f = (struct dhcp_frame *)udp_get_tx_buffer();
++	uint8_t *o = (uint8_t *)f + 240;
++	int i;
++
++	for(i=0;i<DHCP_SEND_LEN;i++) ((uint8_t *)f)[i] = 0;
++
++	f->op    = 1;                 /* BOOTREQUEST */
++	f->htype = 1;                 /* ethernet */
++	f->hlen  = 6;
++	f->xid   = dhcp_xid;
++	/* Ask for a BROADCAST reply: we have no address to be unicast to. */
++	f->flags = htons(0x8000);
++	f->magic = htonl(DHCP_MAGIC);
++	for(i=0;i<6;i++) f->chaddr[i] = macaddr[i];
++
++	*o++ = DHCP_OPT_MESSAGE_TYPE; *o++ = 1; *o++ = type;
++
++	if(type == DHCP_REQUEST) {
++		/* Both are REQUIRED in a selecting-state REQUEST, and a server
++		 * that sees neither will ignore it rather than NAK. */
++		*o++ = DHCP_OPT_REQUESTED_IP; *o++ = 4;
++		*o++ = (dhcp_yiaddr >> 24) & 0xff; *o++ = (dhcp_yiaddr >> 16) & 0xff;
++		*o++ = (dhcp_yiaddr >>  8) & 0xff; *o++ =  dhcp_yiaddr        & 0xff;
++		*o++ = DHCP_OPT_SERVER_ID; *o++ = 4;
++		*o++ = (dhcp_server_id >> 24) & 0xff; *o++ = (dhcp_server_id >> 16) & 0xff;
++		*o++ = (dhcp_server_id >>  8) & 0xff; *o++ =  dhcp_server_id        & 0xff;
++	}
++
++	/* Without 66 in the parameter request list a conforming server has no
++	 * reason to send it, even when it is configured. */
++	*o++ = DHCP_OPT_PARAM_LIST; *o++ = 3;
++	*o++ = 1; *o++ = 3; *o++ = DHCP_OPT_TFTP_SERVER;
++	*o++ = DHCP_OPT_END;
++
++	udp_send(DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DHCP_SEND_LEN);
++}
++
++/* Spin-wait for a reply, in the same shape as udp_arp_resolve's retry loop.
++ *
++ * Sizing matters in both directions. udp_service() is one CSR read, so an
++ * iteration is tens of cycles at 40MHz -- roughly 100-200ms for this count.
++ * Too short and a relayed DHCP round trip (these cards are relayed to a DC on
++ * another subnet) never lands, and the card silently falls back to the
++ * compiled-in address, which is the bug this whole client exists to fix. Too
++ * long and every card pays it on every boot: netboot runs BEFORE flashboot on
++ * this build, so even cards that will boot from flash wait here first.
++ *
++ * Two tries, not eight: a lost DISCOVER is worth one retry, and beyond that
++ * the honest answer is "no DHCP here" rather than a slower boot for everyone. */
++#define DHCP_SPIN 400000
++
++static int dhcp_exchange(const uint8_t *macaddr, int type, int want)
++{
++	int tries, timeout;
++
++	for(tries=0;tries<2;tries++) {
++		dhcp_got = 0;
++		dhcp_send(macaddr, type);
++		for(timeout=0;timeout<DHCP_SPIN;timeout++) {
++			udp_service();
++			if(dhcp_got == want) return 1;
++		}
++	}
++	return 0;
++}
++
++int udp_dhcp_request(const uint8_t *macaddr, struct udp_dhcp_lease *out)
++{
++	uint32_t saved_ip = my_ip;
++	udp_callback saved_bx = bx_callback;
++	int ok = 0;
++
++	out->local_ip = 0;
++	out->boot_server = 0;
++
++	dhcp_yiaddr = dhcp_siaddr = dhcp_server_id = dhcp_opt66 = 0;
++	/* Not random, and it does not need to be: the xid only has to be
++	 * unique against replies arriving at THIS card right now, and the MAC
++	 * already is. */
++	dhcp_xid = (macaddr[2]<<24)|(macaddr[3]<<16)|(macaddr[4]<<8)|macaddr[5];
++
++	udp_set_ip(0);
++	udp_set_mac(macaddr);
++	udp_set_broadcast();
++	udp_set_broadcast_callback(dhcp_rx);
++
++	if(dhcp_exchange(macaddr, DHCP_DISCOVER, DHCP_OFFER)) {
++		udp_set_broadcast();   /* the OFFER overwrote nothing, but be explicit */
++		if(dhcp_exchange(macaddr, DHCP_REQUEST, DHCP_ACK)) {
++			out->local_ip    = dhcp_yiaddr;
++			out->boot_server = dhcp_opt66 ? dhcp_opt66 : dhcp_siaddr;
++			ok = 1;
++		}
++	}
++
++	udp_set_broadcast_callback(saved_bx);
++	if(!ok) udp_set_ip(saved_ip);   /* leave the caller exactly as we found it */
++	return ok;
++}
++
++#endif /* ETH_UDP_BROADCAST */
++
+ void udp_set_callback(udp_callback callback)
+ {
+ 	rx_callback = callback;
+@@ -645,7 +886,19 @@
+ 		struct ip_header *hdr = &rxbuffer->frame.contents.udp.ip;
+ 		if(hdr->version != IP_IPV4)
+ 			return;
+-		if(ntohl(hdr->dst_ip) != my_ip)
++		/* A broadcast has to survive THIS test, not just the one in
++		 * process_udp(). Upstream drops every packet whose dst_ip is not
++		 * ours right here, one level above the broadcast branch further
++		 * down -- which makes udp_set_broadcast_callback() and that whole
++		 * branch unreachable for a real 255.255.255.255 datagram. It is
++		 * dead code as shipped, and DHCP is exactly the case that needs
++		 * it: a client with no address yet can only be answered by
++		 * broadcast, so every reply was discarded here. */
++		if(ntohl(hdr->dst_ip) != my_ip
++#ifdef ETH_UDP_BROADCAST
++		   && ntohl(hdr->dst_ip) != IPTOINT(255, 255, 255, 255)
++#endif
++		  )
+ 			return;
+ 		if (hdr->proto == IP_PROTO_UDP)
+ 			process_udp();
+--- a/litex/soc/software/bios/boot.c
++++ b/litex/soc/software/bios/boot.c
+@@ -539,7 +539,68 @@
+ }
+ #endif
+ 
++#if defined(CSR_SPIFLASH_MMAP_MASTER_CS_ADDR) && defined(ETH_UDP_BROADCAST)
++/* Per-card MAC, derived from the SPI flash unique ID.
++ *
++ * Without this the BIOS uses one compiled-in MAC for the WHOLE FLEET, so every
++ * card netboots as the same host at the same address. That is why the
++ * boot-server lookup upstream has to identify cards by ARP instead of by the
++ * address they came from, and it is why a DHCP reservation cannot target an
++ * individual card at BIOS time.
++ *
++ * MUST match sw_rust/barsign_disp/src/flash_id.rs exactly -- the firmware
++ * derives its MAC the same way, and if the two disagree the card takes one
++ * lease as the BIOS and a different one as the firmware.
++ *
++ * Safe to do here even though flashboot() runs later: the BIOS lives in the
++ * integrated ROM at 0x0, not XIP from this flash. phyconfig is saved and
++ * restored anyway, because flashboot() is the fallback that actually boots
++ * these cards today and it reads through the mmap interface.
++ */
++static uint8_t spi_xfer(uint8_t tx)
++{
++	while(!(spiflash_mmap_master_status_read() & (1 << CSR_SPIFLASH_MMAP_MASTER_STATUS_TX_READY_OFFSET)));
++	spiflash_mmap_master_rxtx_write(tx);
++	while(!(spiflash_mmap_master_status_read() & (1 << CSR_SPIFLASH_MMAP_MASTER_STATUS_RX_READY_OFFSET)));
++	return spiflash_mmap_master_rxtx_read();
++}
++
++static void derive_mac_from_flash(void)
++{
++	uint32_t saved_phyconfig = spiflash_mmap_master_phyconfig_read();
++	uint8_t uid[8];
++	int i;
++
++	/* 8-bit transfers, single width, mask=1 */
++	spiflash_mmap_master_phyconfig_write(
++		(8 << CSR_SPIFLASH_MMAP_MASTER_PHYCONFIG_LEN_OFFSET) |
++		(1 << CSR_SPIFLASH_MMAP_MASTER_PHYCONFIG_WIDTH_OFFSET) |
++		(1 << CSR_SPIFLASH_MMAP_MASTER_PHYCONFIG_MASK_OFFSET));
++
++	spiflash_mmap_master_cs_write(1);
++	spi_xfer(0x4B);                       /* Read Unique ID */
++	for(i=0;i<4;i++) spi_xfer(0x00);      /* 4 dummy bytes */
++	for(i=0;i<8;i++) uid[i] = spi_xfer(0x00);
++	spiflash_mmap_master_cs_write(0);
++
++	spiflash_mmap_master_phyconfig_write(saved_phyconfig);
++
++	/* All-zero or all-ones means the read did not work; keep the
++	 * compiled-in MAC rather than putting a bogus one on the wire. */
++	if((uid[0]|uid[1]|uid[2]|uid[3]|uid[4]|uid[5]|uid[6]|uid[7]) == 0x00) return;
++	if((uid[0]&uid[1]&uid[2]&uid[3]&uid[4]&uid[5]&uid[6]&uid[7]) == 0xff) return;
++
++	macadr[0] = 0x02;                     /* locally administered, unicast */
++	for(i=0;i<5;i++) macadr[i+1] = uid[i] ^ uid[i+3];
++}
++#endif
++
+ void net_init(void) {
++#if defined(CSR_SPIFLASH_MMAP_MASTER_CS_ADDR) && defined(ETH_UDP_BROADCAST)
++	derive_mac_from_flash();
++	printf("MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
++		macadr[0], macadr[1], macadr[2], macadr[3], macadr[4], macadr[5]);
++#endif
+ 	printf("Local IP: %d.%d.%d.%d\n", local_ip[0], local_ip[1], local_ip[2], local_ip[3]);
+ 	udp_start(macadr, IPTOINT(local_ip[0], local_ip[1], local_ip[2], local_ip[3]));
+ }
+@@ -555,6 +616,39 @@
+ 	printf("Booting from network...\n");
+ 
+ 	net_init();
++
++#ifdef ETH_UDP_BROADCAST
++	/* Ask DHCP where the boot server is, so it is not welded into the
++	 * bitstream. Option 66 wins, then BOOTP siaddr, then the compiled-in
++	 * REMOTEIP -- so a card still boots on a network that serves neither.
++	 * Failure is silent and cheap by design; this runs before flashboot on
++	 * every card, including ones that will boot from flash anyway. */
++	{
++		struct udp_dhcp_lease lease;
++		if(udp_dhcp_request(macadr, &lease)) {
++			if(lease.local_ip) {
++				local_ip[0] = (lease.local_ip >> 24) & 0xff;
++				local_ip[1] = (lease.local_ip >> 16) & 0xff;
++				local_ip[2] = (lease.local_ip >>  8) & 0xff;
++				local_ip[3] =  lease.local_ip        & 0xff;
++				udp_set_ip(lease.local_ip);
++				printf("DHCP IP: %d.%d.%d.%d\n",
++					local_ip[0], local_ip[1], local_ip[2], local_ip[3]);
++			}
++			if(lease.boot_server) {
++				remote_ip[0] = (lease.boot_server >> 24) & 0xff;
++				remote_ip[1] = (lease.boot_server >> 16) & 0xff;
++				remote_ip[2] = (lease.boot_server >>  8) & 0xff;
++				remote_ip[3] =  lease.boot_server        & 0xff;
++				printf("DHCP boot server (opt 66): %d.%d.%d.%d\n",
++					remote_ip[0], remote_ip[1], remote_ip[2], remote_ip[3]);
++			}
++		} else {
++			printf("DHCP: no reply, using compiled-in addresses\n");
++		}
++	}
++#endif
++
+ 	printf("Remote IP: %d.%d.%d.%d\n", remote_ip[0], remote_ip[1], remote_ip[2], remote_ip[3]);
+ 
+ 	ip = IPTOINT(remote_ip[0], remote_ip[1], remote_ip[2], remote_ip[3]);
