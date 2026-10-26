@@ -1,0 +1,10 @@
+# Add to the owning host's <host>-conf.yml in /srv/docker/homepage.
+# type: proxy gives a same-origin mount and the live /healthz version badge.
+- Marquee:
+    icon: mdi-television-guide
+    href: /marquee/
+    description: LED panel fleet + content
+    type: proxy
+    upstream: http://127.0.0.1:8411
+    strip_prefix: true
+    healthz: http://127.0.0.1:8410/healthz

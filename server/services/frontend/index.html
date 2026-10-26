@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Marquee</title>
+    <link rel="icon" href="./icon.svg" />
+    <script>
+      // Runtime mount detection: treat ONLY a known mount as a prefix, so a
+      // deep link like /panels is not misread as one. This is what lets a
+      // single build serve at the hostname root and under /marquee/.
+      (function () {
+        var KNOWN = ["marquee"];
+        var seg = location.pathname.split("/")[1];
+        var base = KNOWN.indexOf(seg) >= 0 ? "/" + seg + "/" : "/";
+        var b = document.createElement("base"); b.href = base;
+        document.head.appendChild(b);
+        window.__APP_BASE__ = base.replace(/\/$/, "");
+        try {
+          var t = localStorage.getItem("marquee.theme");
+          if (t === "light") document.documentElement.classList.remove("dark");
+        } catch (e) {}
+      })();
+    </script>
+  </head>
+  <body data-1p-ignore data-lpignore data-bwignore>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

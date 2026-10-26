@@ -1,0 +1,28 @@
+--- a/litex/soc/software/bios/main.c
++++ b/litex/soc/software/bios/main.c
+@@ -59,6 +59,12 @@
+ 	if (serialboot() == 0)
+ 		return;
+ #endif
++#ifdef CSR_ETHMAC_BASE
++#ifdef CSR_ETHPHY_MODE_DETECTION_MODE_ADDR
++	eth_mode();
++#endif
++	netboot(0, NULL);
++#endif
+ #ifdef FLASH_BOOT_ADDRESS
+ 	flashboot();
+ #endif
+@@ -71,12 +77,6 @@
+ #if defined(CSR_SATA_SECTOR2MEM_BASE)
+ 	sataboot();
+ #endif
+-#ifdef CSR_ETHMAC_BASE
+-#ifdef CSR_ETHPHY_MODE_DETECTION_MODE_ADDR
+-	eth_mode();
+-#endif
+-	netboot(0, NULL);
+-#endif
+ 	printf("No boot medium found\n");
+ }
+ #endif

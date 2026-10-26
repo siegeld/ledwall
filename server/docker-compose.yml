@@ -1,0 +1,81 @@
+services:
+  api:
+    build: { context: ., dockerfile: services/api/Dockerfile }
+    image: marquee-api:${TAG:-latest}
+    restart: unless-stopped
+    # Alembic owns the schema, and it must run before anything opens a session.
+    # The player used to create missing tables itself, which raced the migration
+    # and won -- see the comment in services/player/main.py.
+    command: ["sh", "-c", "alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port 8000"]
+    env_file: [.env]
+    volumes:
+      - ./VERSION:/app/VERSION:ro
+      - ./data:/data
+      # Shows live in files under custom/ and are imported into the DB. Mounted
+      # read-write because `make shows-export` writes back out to them.
+      - ./custom:/custom
+      - ./scripts:/app/scripts:ro
+      # Plex libraries, for the plex: source (sources.py). On a host that has
+      # no krb5 CIFS to the file estate yet, point these at an empty local dir
+      # in .env -- a sender must come up without the media shares.
+      - ${MARQUEE_SHARE_HOMEMOVIES:-/share/homemovies}:/share/homemovies:ro
+      - ${MARQUEE_SHARE_MOVIES:-/share/movies}:/share/movies:ro
+    ports: ["8410:8000"]
+
+  player:
+    build: { context: ., dockerfile: services/player/Dockerfile }
+    image: marquee-player:${TAG:-latest}
+    restart: unless-stopped
+    environment:
+      # Send each frame N times under one frame_id; the gateware deduplicates.
+      # 2 defeats the switch-side packet trains measured 2026-10-24 (see
+      # marquee_core/stream.py REDUNDANT_COPIES). Needs packet_delay halved on
+      # the card so both copies fit the frame period. 1 = plain.
+      MARQUEE_REDUNDANT_COPIES: ${MARQUEE_REDUNDANT_COPIES:-1}
+    env_file: [.env]
+    # host networking: the pixel stream is ~1250+ UDP pkt/s to panels on the
+    # local segment, and TFTP boot replies must come from the host address the
+    # panel's BIOS was pointed at. NAT would break both.
+    network_mode: host
+    volumes:
+      - ./VERSION:/app/VERSION:ro
+      - ./data:/data
+      # Data providers are loaded from custom/<site>/providers/ -- read-only
+      # here because the player only ever imports them, where the api also
+      # writes shows back out under custom/.
+      - ./custom:/custom:ro
+      # Plex libraries, for the plex: source (sources.py). On a host that has
+      # no krb5 CIFS to the file estate yet, point these at an empty local dir
+      # in .env -- a sender must come up without the media shares.
+      - ${MARQUEE_SHARE_HOMEMOVIES:-/share/homemovies}:/share/homemovies:ro
+      - ${MARQUEE_SHARE_MOVIES:-/share/movies}:/share/movies:ro
+
+  # Opt-in: DHCP for a DEDICATED panel link off a second NIC. See
+  # doc/dedicated-link.md. Bound to PANEL_IF only; leases exactly the card(s)
+  # listed, option 66 = this host (the TFTP server baked into the bitstream).
+  dnsmasq:
+    profiles: ["panel-link"]
+    image: dockurr/dnsmasq:latest
+    network_mode: host
+    cap_add: [NET_ADMIN]
+    restart: unless-stopped
+    # The image's wrapper (/usr/bin/dnsmasq.sh) ignores the command line and
+    # runs dnsmasq from an env-templated DNS config -- verified 2026-10-24:
+    # no udp/67 listener, DNS-only log. Bypass it and run the binary.
+    entrypoint: ["dnsmasq"]
+    command: >
+      --keep-in-foreground --log-facility=- --log-dhcp --port=0
+      --interface=${PANEL_IF:-SET_PANEL_IF_IN_DOTENV}
+      --bind-interfaces
+      --dhcp-range=${PANEL_POOL_START:-192.168.61.100},${PANEL_POOL_END:-192.168.61.120},${PANEL_NETMASK:-255.255.255.0},12h
+      --dhcp-host=02:00:5e:00:53:02,${PANEL_CARD_IP:-192.168.61.11},e320
+      --dhcp-option=66,${PANEL_SENDER_IP:-192.168.61.1}
+      --dhcp-option=3
+      --dhcp-option=6
+
+  frontend:
+    build: { context: ., dockerfile: services/frontend/Dockerfile }
+    image: marquee-web:${TAG:-latest}
+    restart: unless-stopped
+    ports: ["8411:3000"]
+    depends_on: [api]

@@ -1,0 +1,2027 @@
+# Changelog
+
+## [0.43.0] - 2026-10-26
+
+### Added
+- **`zz-geometry-256x512`**: sixteen labelled, colour-coded group tiles
+  (`1 J1-TL` ... `16 J4-BR`) with 1 px rules down the x=128 seam and across
+  each module's y=64 seam -- the mapping check for a four-output card. Used
+  to prove J3/J4 on the E320: every tile in place, rules unbroken.
+- **`15-video-banner-256x512`**: the movie-and-ticker banner for a
+  four-module wall. The video takes the extra height and the banner keeps its
+  48 px on the bottom module. It uses **`fit: cover`**: in a 256x464 box,
+  `smart` letterboxes 16:9 footage ~44% top and bottom, so the picture started
+  ~100 rows down and each module showed the slice meant for the one below it.
+
+### Fixed
+- **The editor's preview renders at the wall's size.** `POST /preview.png`
+  takes optional `width`/`height`; the Content page sends the size of the
+  first wall the show is live on, labels the preview "as on <wall> (WxH)" and
+  warns when the show's declared size differs. It used to render at the show's
+  declared size, so a 256x256 show previewed complete while the 256x512 wall it
+  played on had two black modules -- which read as dead connectors.
+- The `Box` docstring (`scene.py`) and the comment above `renderer.render` in
+  the player said an undersized show is stretched to the wall. It is not:
+  render always happens at the wall's size and integer boxes stay absolute.
+- Three shows read the "PANEL ... FPS" ticker field from the E320's address
+  before it moved to the dedicated panel link, so the field had been blank
+  since the move.
+
+### Documentation
+- **ARCH.md** brought up to date with four-module walls: the services table
+  (the frontend is React + Vite behind nginx, not Next.js; `dnsmasq` for the
+  panel link; TFTP is a thread in the player); how a card's connectors tile
+  its rectangle and why a layout change needs a card boot; **frames are
+  rendered at the wall's size** and integer boxes stay absolute, with the
+  preview's different behaviour called out; both wire headers byte by byte,
+  when the wide one is used, packets per frame by wall size, the card's
+  512-chunk ceiling and what the card does with a frame; pacing worked
+  through (`packet_delay` per frame size, `SEND_BATCH` pairs, the
+  `MIN_SEND_GAP` floor that binds only after a stall, how fragmentation cost
+  frame rate, `MARQUEE_REDUNDANT_COPIES`); the render/send thread split, the
+  stream hold during a card's BIOS netboot, and one writer per card.
+- **doc/scenes.md**: the absolute-box trap again at 256x512, how to read a
+  card's framebuffer to tell black content from a dead connector, the
+  geometry shows, and `fit: smart` on a very tall box (use `cover`).
+- **API.md**: authentication (what is open, what needs admin); the wall
+  content/mode endpoints, `bootconfig`, `panel-types`, `drive-types`,
+  `rgb-orders`, preview and the session/settings/token routes, all previously
+  undocumented; pinning firmware with `"reboot": false`; the one-boot order
+  for a gateware + firmware pair; `packet_delay` sizing; which card fields
+  reach the card at boot and which (`width`/`height`) do not.
+- **README.md**: what marquee drives today, the wide header, corrected
+  bandwidth figures, and "seven things", not five.
+- **doc/dedicated-link.md**: a "Four panels" section with the measured
+  numbers and the fragmentation check.
+
+## [0.42.2] - 2026-10-26
+
+### Fixed
+- **Wide frames ('B','W', over 255 chunks) send 486 pixels a chunk, not 487.**
+  487 px behind the 12-byte wide header made a 1501-byte datagram, one over the
+  MTU: the kernel fragmented every chunk, the card parsed only the first
+  fragment, and the last pixel of each chunk never landed -- a fixed diagonal
+  lattice of stale pixels on a four-module E320 wall, with every card counter
+  clean. Needs colorlight gateware 1.46.0 / firmware 3.9.0 on any card that
+  receives wide frames; frames of 255 chunks or fewer are byte-for-byte
+  unchanged. `stream.py` now asserts the MTU budget for both headers at import,
+  and `tests/test_wire.py` checks every packet of a 270-chunk frame fits and
+  that the frame reassembles exactly.
+
+## [0.42.1] - 2026-10-25
+
+### Fixed
+- The stream hold from 0.42.0 needs **two consecutive misses** on a new 5 s
+  liveness probe before it lands. On the first deploy a single slow
+  `/api/status` (the card's HTTP shares the receive ISR with the pixel path)
+  held the stream for a whole 15 s poll interval -- a blackout the fix had just
+  introduced. The hold still lands within ~10 s of a card going away, inside
+  the ~35 s its BIOS keeps retrying the netboot; program reconciliation and
+  stats sampling stay at `MARQUEE_POLL_INTERVAL_S`.
+
+## [0.42.0] - 2026-10-25
+
+### Fixed
+- **The player holds a card's stream while its firmware is not answering.** A
+  rebooting card sits in its BIOS for the netboot, and the BIOS has no hardware
+  pixel path: streamed packets land in its two CPU receive slots and starve the
+  TFTP transfer. Measured on the dedicated link with nothing else on the wire:
+  the 473 KB firmware crawled at 45 kbps, needed 7 retransmissions and the BIOS
+  gave up at block 228 -- the card never came back. With the stream held the
+  same transfer took under a second. `Supervisor.tick` now marks a card whose
+  `/api/status` fails (`DOWN_HOSTS`) and the sender skips its payloads until
+  the next probe answers, at which point DMA is re-asserted as before.
+  (`services/player/player.py`)
+
+### Changed
+- `dnsmasq` (profile `panel-link`) runs the dnsmasq binary directly: the
+  dockurr image's wrapper ignores the command line and came up DNS-only with no
+  DHCP at all.
+- The panel bus is a dedicated /24 per sender host (sender `.1`, card k `.1k`),
+  set in `.env`; the earlier "reuse the LAN's /24, the addresses are baked" rationale was wrong
+  -- the BIOS has read option 66 since colorlight 2.3.0. `doc/dedicated-link.md`.
+- The Plex share mounts are overridable (`MARQUEE_SHARE_HOMEMOVIES`,
+  `MARQUEE_SHARE_MOVIES`) so a sender host comes up before its CIFS works.
+
+## [0.41.0] - 2026-10-24
+
+The ticker jitter and the video flicker were one defect, and it is gone.
+
+### Fixed
+- **`MARQUEE_REDUNDANT_COPIES`: send each frame N times under one frame id**
+  (`CardStream.REDUNDANT_COPIES`; compose default **1** -- measured, then
+  deliberately switched off, see below).
+  The card loses chunks to packet TRAINS assembled in the switch's egress
+  toward it -- up to 59 back-to-back packets, measured on the card with
+  gateware 1.37.0's `arrive_run_max` -- and a frame missing even one chunk
+  used to be DISPLAYED with a hole of stale pixels (fixed on the card side by
+  gateware 1.36.0, which now holds such a frame back). The host cannot stop
+  the switch queueing; it can make the loss not matter. The gateware
+  deduplicates, a train lasts ~8 ms, copies are ~13-20 ms apart, so a chunk's
+  copies never share one. Measured on the two-module E320, 180 s quiet:
+
+      copies   frames held (not shown)   delivered fps   underruns
+      1        1.06/s                    19.11           0
+      2        0.425/s                   19.74           0
+      3        0.000/s  (none)           20.00           0
+
+  The exponent is what wins: with the port blocked ~1.6% of the time, per-chunk
+  loss is ~2% at any rate and a 135-chunk frame fails at 135 x p^k.
+  `packet_delay` must shrink with k so k x chunks x pd fits the frame period
+  (card 2 ran at 0.0001 for k=3). **Switched off again the same evening**: the
+  requirement is THREE panels, and k=3 does not fit them -- 606 packets a frame
+  will not fit 50 ms above the 200 us pacing floor, and at two panels k=3
+  already put pixel writes at ~63% of the card's DRAM time, so three would
+  starve the scan-out. k=2 fits three panels but a 202-chunk frame has more
+  chances to lose a chunk twice, landing near today's hold rate. Redundancy is
+  a two-panel stopgap, nothing more. The three-panel answer is to remove the
+  trains: the panel moves to a dedicated link off the sender's second NIC
+  (RB-5602's vlan_panel, by cable). The knob stays in the code, default 1.
+- **The trains' origin was found on the network:** the core access switch's uplink to the lab access switch
+  (`ge-5/0/34`, gigabit, no class-of-service, every VLAN in one best-effort
+  queue) carries ~193 Mbit/s of lab traffic and tail-drops 44-103 packets/s --
+  122.6 million since boot. The card's stream queues behind lab bursts there
+  and arrives as 40-60-packet trains. That is a lab-network problem whether or
+  not the panel stays on it.
+- **No pacing wait after the last chunk of a frame** -- 600 us of dead time per
+  frame, measured, falling exactly where the render thread wants the GIL.
+- `SO_SNDBUF` is unchanged at 1 MB. Sizing it to the card's FIFO was tried,
+  measured across 60/90/240 s windows, and is unresolvable in the content
+  noise of a video show; the file records why so nobody re-runs it.
+
+### Changed
+- `make be-test` finds the firmware tree at `/share/src/colorlight` as well as
+  the combined-repo layout, so the four cross-repo wire-protocol tests RUN
+  instead of skipping (147 passed, 4 skipped -> 152 passed, including a new
+  assertion on the gateware's copy of the 487-pixel chunk stride).
+- Bitstream upload is a plain `def`, so its ~0.5 MB write no longer blocks the
+  API's event loop.
+
+## [0.40.0] - 2026-10-21
+
+Brought up a second LED module (256x256) and chased a "glitch every couple of
+seconds" to four separate causes, none of them the one being blamed.
+
+### Fixed
+- **A live binding blocked the render thread, which starved the sender.**
+  `{http:...}` cached for 10 s but a MISS did a synchronous `urlopen` with a
+  3 s timeout, inline in compose; `{ha:...}` called Home Assistant the same
+  way. A banner carrying one `{http:}` and five `{ha:}` bindings could stall
+  the whole wall for seconds at a time:
+
+      compose 0.0 fps -- frame 610.3ms of 50.0ms budget, layers {text: 609.51}
+      sender has not completed a frame in 29.0s -- starved or blocked
+
+  Both now serve the last known value and refresh on a background pool, with
+  in-flight dedupe and a give-up window after which the field shows the house
+  no-value glyph. `history()` too -- it is the slowest binding there is.
+  Measured: a 2 s source returns in 0.2 ms, 41 resolves cause 1 fetch.
+  Delivered frame rate went 17.8 -> 20.0 fps.
+
+- **Editing a show did nothing until you switched shows or restarted.** The
+  reload test compared only the show ID, so the body was re-read from the
+  database every tick and discarded. Anyone editing in the UI hit this every
+  time: the edit saves, the wall does not change, no error. Caught because the
+  database held `fps: 22.22` while the player sent exactly 20.00. Now keyed on
+  a hash of the body, and it logs `show N edited -- reloading`.
+
+- **`text`, `rows` and `plot` layers painted their box opaque black.** Every
+  layer returned an RGB tile the compositor pasted wholesale, so no show could
+  put text over a gradient, an image or video and have the backdrop show
+  through. A header gradient survived only as a 4 px sliver above and left of
+  its text boxes. These layers are now RGBA and the compositor masks by alpha;
+  `solid`/`gradient`/`image`/`video` are unchanged. `opacity` below 1 now
+  fades the glyphs rather than a black rectangle over the picture.
+  **This changes how existing shows look** -- see doc/scenes.md.
+
+- **`shows-export` + `shows-import` corrupted show files.** Export prepends a
+  `# name:` header unconditionally; import stripped only the first, so every
+  round trip added a line. `13-video-banner.yaml` already carried two. Import
+  now strips the whole leading header block, and only the leading one -- a
+  `# name:` further down is prose and stays in the body. Five round trips are
+  byte-identical. Five stored bodies that had absorbed a header were cleaned.
+
+- **The sender ran at 19.58 fps against 20.0 rendered**, losing one frame
+  every 2.4 s. Because the renderer snaps motion to whole pixels per frame,
+  each missing frame is a double step -- the visible hitch. The cause was not
+  Python: per packet, slicing the body is 0.32 us, packing the header 0.13,
+  the concat 0.41, `sendto` 4.92, about **5.9 us of work** -- against a
+  `time.sleep(200us)` that **overshoots by a median of 53 us**. Pacing every
+  second packet halves the sleeps. Measured on the wire after: median 50.0 ms,
+  p99 50.6, max 50.6, **20.00 fps**, from 51.0/60.9/60.9 and 19.58 fps.
+
+  A Rust or C sender would NOT fix this -- it removes the 5.9 us and inherits
+  the 53 us, since `nanosleep` overshoots the same in any language. See ARCH.
+
+- **The sender's catch-up fired a back-to-back pair on the wire.** Floored at
+  `MIN_SEND_GAP` = 200 us. Wire-measured: sub-100 us gaps went from 8.1% in
+  chunks 4-7 to **0.00% everywhere**, minimum gap 3.3 us -> 206 us.
+
+### Changed
+- **A scrolling string is rasterised once into a cached strip** and the window
+  blitted out of it: **2.756 ms a frame -> 0.008 ms, 347x**, pixel-identical at
+  all 2055 positions of a full wrap. Drawing only the visible *substring* was
+  tried first and is wrong -- it must be placed at a fractional x, and PIL
+  anti-aliases that differently from the integer position a full draw uses; 25
+  of 1028 positions differed. Player CPU 126.6% -> 99.4%.
+- `clk_div` for the P1.25 module goes **6 -> 4**, taking the panel refresh from
+  44.45 Hz to 66.67 Hz with underruns still at 0.00/s. 44 Hz is below human
+  flicker fusion, which is why dark content beat visibly and bright content did
+  not. The old value was a workaround for a problem gateware 1.29.0's line
+  buffer had already fixed, measured on 1.28.0 and never re-swept.
+- `packet_delay` 350 -> 300 us for the two-module chunk count (135/frame, not
+  68), giving 19% budget headroom instead of 6%.
+- A new card inherits `clk_div`, `write_throttle` and `packet_delay` from its
+  module type.
+
+### Added
+- `rail-rotation-256x256`, `14-video-banner-256x256`, `zz-geometry-256x256`
+  and `zz-brightness-ladder` for the two-module wall. The geometry board labels
+  all **eight** 128x64 group tiles, because four different mapping faults look
+  alike on ordinary content.
+- Six shows that existed only in the database are now exported to
+  `custom/<site>/shows/`: amtrak, lirr, metro-north, rail-rotation, welcome,
+  zz-cheap-test.
+
+### Documentation
+- **doc/scenes.md said a sized show is stretched to the wall. It is not.** The
+  player always renders at the wall's size, so a 256x128 show on a 256x256 wall
+  paints the top half and leaves the bottom **black** -- indistinguishable from
+  a dead connector. Corrected, with a table of what each combination does, and
+  a note that `speed` must NOT be scaled with `size`.
+- ARCH.md gains what the pacing does and does not control (`SO_SNDBUF`, the
+  GIL coupling between render and send, kernel pacing), why render cost is a
+  transmission concern, and the layer-compositing and strip-cache rules.
+
+## [0.39.0] - 2026-10-20
+
+### Fixed
+- **Render and send were welded together, so a slow compose made the
+  TRANSMISSION late.** The player composed a frame, transmitted it, then slept
+  to the next deadline, all on one thread. A frame whose render overran its
+  slot was therefore delivered late, and a late frame is one the card
+  discards. Measured on the bench: 0.24 dropped frames/s on video against
+  0.02/s on content costing nothing to render -- a twelve-fold difference, on
+  a 32-core host idling at a load of 2.
+
+  Rendering now feeds a bounded queue and a sender thread transmits on a
+  strict schedule. Frame timing went from up to **36 ms of jitter to 0**, with
+  the interval at exactly 50 ms. PIL and socket sends both release the GIL, so
+  the two threads genuinely overlap.
+
+  The queue is **40 frames**, two seconds at 20 fps. None of this content is
+  live -- recorded film and rendered signage -- so lead time costs nothing
+  perceptible, and depth is what absorbs a compose that overruns badly rather
+  than slightly. It does not hide a persistently slow renderer: every frame
+  carries an ABSOLUTE deadline and the sender discards one already past due
+  rather than bunching it against the next.
+
+- **The aspect-ratio fix resampled every video frame twice.** Correcting
+  non-square pixels by prepending `scale=<display size>` meant a 1920x1080
+  source was resampled to 1620x1080 before being scaled down to 256x104 -- a
+  full-resolution pass per frame, on the thread with a 50 ms budget. The
+  target size is now computed arithmetically from the display geometry and
+  emitted as ONE scale. Same output, half the resampling.
+
+### Notes
+- The ~1.3% of frames the card still discards are **not** the player: they are
+  burst packet loss. `a UPnP/mDNS reflector on the LAN` (192.168.1.57) reflects ~200 large mDNS
+  packets/s onto the panel subnet, which overruns the card's receive FIFO 18
+  times/s, and each overrun takes ~8 consecutive pixel chunks -- past the 2
+  the repair path can patch. Fix is to stop reflecting onto that VLAN.
+
+## [0.38.0] - 2026-10-20
+
+### Changed
+- `write_throttle` for the P1.25 module is **8**, measured rather than guessed.
+  Swept against the gateware's underrun counter (colorlight 1.28.0), which
+  counts pixels the serialiser latched before their memory read returned --
+  every one a wrong pixel on the glass:
+
+  | clk_div | throttle | underruns/s |
+  | --- | --- | --- |
+  | 4 | 0 | 5454 |
+  | 4 | 2 | 5319 |
+  | 6 | 0 | 13.8 |
+  | 6 | 4 | 3.0 |
+  | **6** | **8** | **0.0** |
+
+  `clk_div` is the dominant term and the write spacing is secondary: at
+  8.75 MHz the scan-out starves on its own and spacing the writes helps by 2%.
+  At 5.83 MHz the reads fit, and what remains is write contention, which the
+  spacing removes -- 1 underrun in 60 s against 13.8/s, a 700x reduction, with
+  streaming untouched at 19.6 fps and no partial frames.
+
+### Added
+- **The module's OPERATING POINT travels with its type**: `clk_div` and
+  `write_throttle` are now `PANEL_TYPES` fields, served in the boot config
+  beside `drive` and `group_origins`.
+
+  Both were live-only diagnostics, which meant a value found on the glass was
+  thrown away by the next reboot. The P1.25 bench module ran `clk_div 6` for an
+  evening and came back on the preset's 4 every time the card restarted,
+  silently handing back the snow it had just been tuned out of -- and the
+  operator could not tell, because nothing reports a knob that reverted.
+
+  `write_throttle` spaces the pixel DMA's writes. The S-PWM scan-out reads
+  every pixel on demand with no row buffer, so a chunk -- 487 writes back to
+  back -- starves those reads, and a late read is a white dot. Measured
+  2026-10-20 on one detailed image: zero write traffic is perfectly clean,
+  245 chunks/s shows a little snow, 1360 shows a lot, and nothing but write
+  traffic moves it. Solid colours never show it at any rate, because a stale
+  pixel equals the correct one.
+
+  Values are a per-module measurement and belong with the module, not compiled
+  into a bitstream and not retyped into every card's YAML. Needs colorlight
+  firmware 2.99.0, which reads the two keys; older firmware ignores them.
+
+## [0.37.0] - 2026-10-20
+
+### Fixed
+- **`{ha:...}` can read an ATTRIBUTE, not just the state:
+  `{ha:weather.dashboard|temperature}`.** The numbers worth putting on a sign
+  are often not the state. A weather entity's state is `sunny`; its
+  temperature, apparent temperature, humidity and wind are all attributes, so
+  there was no spelling of `{ha:weather.dashboard}` that could produce a number.
+  A missing attribute gives the house no-value glyph rather than falling back
+  to the state, because showing `sunny` where a temperature was asked for is
+  worse than showing nothing.
+
+  Found chasing a banner that rendered `INSIDE —F`. The attribute gap was real
+  but it was not the cause: **`ha.token` was unset**, and `build_bindings()`
+  wires Home Assistant up only when both `ha.base_url` and `ha.token` are
+  present, so EVERY `{ha:...}` in every show had been resolving to the no-value
+  glyph regardless of what it named. The token is deployment config and lives
+  in the settings table, not here. If Home Assistant values are dashes, check
+  that setting before suspecting the entity id.
+- **A stream-mode card could still be running an on-board program, and the
+  player streamed into it anyway.** The reconcile loop checked one direction
+  only: a program-mode card that was not running its program got it started,
+  but a stream-mode card running a program was left alone. Two writers on one
+  framebuffer. The firmware resolves it by holding the stream while a program
+  is active, so the panel shows the PROGRAM while marquee reports the card as
+  streaming -- which from the outside is indistinguishable from working. The
+  player now stops any program it finds on a card it is streaming to, the
+  mirror of what it already did for program-mode cards, so one writer is an
+  invariant the player maintains rather than something an operator remembers.
+  See the `panel-program-two-writers` note.
+- **Anamorphic video rendered stretched: the fit chain ignored sample aspect
+  ratio.** `_source_size()` probed only width and height, and
+  `force_original_aspect_ratio` reasons about STORED dimensions, so a file
+  whose pixels are not square was fitted to the wrong shape by every mode --
+  `cover`, `contain`, `smart` and `stretch` alike. The 1965 home movie stores
+  1920x1080 with a 3:4 sample aspect: it is a 4:3 picture, 1440x1080 is its
+  real geometry, and marquee treated it as 16:9 and stretched it horizontally
+  by a third. Reported from the glass as "not square image".
+
+  The probe now reads `sample_aspect_ratio` and `_source_size()` returns the
+  DISPLAY size, with the filter chain rescaling to square pixels before any
+  fit decision. Every branch below it is then correct without knowing about
+  sample aspect at all. Verified byte-identical output for square-pixel
+  sources and for a file that cannot be probed; on the home movie, 49% of
+  pixels change.
+
+  Unknown or absent sample aspect is treated as square, because assuming
+  otherwise would distort every ordinary video.
+
+### Notes
+- A dark, slightly bowed edge on the left and right of that same home movie is
+  **the film, not the renderer**: the source frame carries 12 pure-black
+  columns on the left and 9 on the right of 1920, plus a ramp that reaches full
+  brightness only around column 40. That is ~2 black plus ~4 ramp columns once
+  scaled to a 256-wide panel, which is exactly what the panel's framebuffer
+  reads, symmetric on both sides. `fit: cover` on a 4:3 source in a 2:1 box
+  scales by width, so the full film width -- gate edge included -- lands on the
+  glass. Cropping it needs a zoom PAST `cover`, which no fit mode expresses; a
+  `box` larger than the canvas does it, since a negative paste origin clips.
+
+## [0.36.0] - 2026-10-19
+
+### Added
+- **Module types.** A card names the module on its connectors
+  (`panel_type`, a key of `marquee_core.models.PANEL_TYPES`; `GET
+  /api/v1/panel-types`). The type carries the module's size, its RGB-group
+  arrangement (`group_origins`), its driver chip and the gateware preset that
+  drives it, and `boot_config()` writes those into the card's `<mac>.yml`
+  after the layout text -- the firmware keeps the last value of a repeated key,
+  so the type wins over a stale number in the YAML and a card with no type is
+  served byte-for-byte what it was before. First entries: `hub75-128x64` and
+  `linsn-p1.25-256x128-dp3264s` (four 128x64 groups in a 2x2, gateware 1.18+).
+  Cards page: a "module type" dropdown; the panel map and driver chip follow
+  it. `DRIVE_TYPES` gains `dp3264s`, the chip actually on the bench module.
+  The authority on each type is `docs/PANELS.md` in the colorlight repo.
+- **Wide frame header (`BW`) for frames over 255 chunks.** `HEADER`'s chunk
+  index and total are u8, so a frame could not exceed 255 chunks = 124,185 RGB
+  pixels -- under four P1.25 panels (one E320 at 4 x 256x128 is 131,072 px =
+  270 chunks). `CardStream` now sends such a frame under `MAGIC_WIDE` with a
+  12-byte header and u16 counters; frames that fit stay on `BM`, byte for byte,
+  so cards on older firmware are untouched. Matches colorlight firmware
+  `bitmap_udp.rs` (`4e39c61`, "Wide protocol end to end"). Indexed (`BI`)
+  frames have no wide form and raise if they would need one.
+
+## [0.35.0] - 2026-10-07
+
+### Fixed
+- **The bitstream name rule rejected every real P1.25 panel preset.** 0.34.1
+  required `-\d+x\d+-`, but the presets the P1.25 modules use are
+  `256x128-icnd1065` (5A-75E) and `256x256-icnd1065-hub320` (E320) — the panel name
+  carries the driver chip and connector family. The panel part may now contain
+  hyphenated qualifiers, with the board still anchored at the front where it is
+  unambiguous.
+
+### Added
+- **Firmware names should say which board they are for**, `<board>[-spwm]-v<semver>.bin`,
+  and an upload that does not is logged. One firmware source builds every board, but
+  the system clock is baked in from the gateware and S-PWM support is a compile-time
+  feature, so a 40 MHz image on 35 MHz gateware boots and then fails at everything
+  time-dependent, and a plain image cannot drive a P1.25 panel.
+  `colorlight-2.20.0.bin` carried none of that. Advisory rather than enforced:
+  `boot.bin` is the fleet default and dozens of historical images predate it.
+
+### Note
+- Both dropdowns now offer real choices for **both boards** — four firmware variants
+  (`5a-75e`, `5a-75e-spwm`, `e320`, `e320-spwm`) and four bitstreams including the
+  P1.25 presets. Previously only E320 firmware existed, because building for a second
+  board required editing a source constant.
+
+## [0.34.1] - 2026-10-07
+
+### Fixed
+- **The required bitstream name left out the geometry compiled into the image.**
+  0.34.0 enforced `<board>-v<semver>.bit`, which cannot distinguish two
+  non-interchangeable bitstreams: `--panel` sets the shift register width and row
+  count and is baked in, so `128x64` and `256x64` are different logic, and
+  `--outputs` likewise. The rule is now
+  `<board>-<panel>-out<n>-v<semver>.bit` — e.g. `e320-128x64-out6-v1.0.0.bit` —
+  matching what colorlight 2.20.0 stamps into the gateware and reports back.
+
+## [0.34.0] - 2026-10-07
+
+### Changed
+- **A bitstream's filename must now BE its identity: `<board>-v<semver>.bit`.**
+  The fleet view shows what a card is RUNNING (read from the gateware's own
+  identifier ROM, `e320-v1.0.0`) beside what was PUSHED to it (the filename). With
+  ad-hoc filenames — `app-e320-128x64.bit` — those two could never agree, so the
+  pair could not answer the one question it exists for: is this live, or written
+  and awaiting a power cycle? The row now says exactly that: `pushed: e320-v1.0.0
+  — live`, or `— awaiting power cycle`.
+
+  Boards are enumerated (`5a-75e`, `e320`) rather than pattern-matched, because a
+  permissive pattern accepted `e320-128x64-v2.18.0.bit` by treating
+  `e320-128x64` as a board name — which is the ad-hoc naming this is meant to
+  stop. Panel geometry is a build variant reported as its own field, not part of
+  an identity. `./build.sh` now prints the exact name to push after a bitstream
+  build, so there is nothing to guess.
+
+### Fixed
+- **Legacy bitstreams could be neither used nor deleted.** The new naming rule
+  guarded `DELETE` as well as upload, so the ad-hoc files it was introduced to
+  eliminate became permanently stuck. Reads, pushes and deletes now validate only
+  against path traversal; the identity rule applies to what you may *create*.
+
+## [0.33.1] - 2026-10-07
+
+### Changed
+- **The bitstream column shows a name, `e320-v1.0.0`, not a build description.**
+  Read from colorlight 2.19.0's `/api/bitstream`, which reports the bitstream's own
+  semver — independent of the firmware's, because the two change at very different
+  rates. The full build string is the cell's tooltip. A card too old to report a
+  version says "no version (built before 2.19.0)" rather than showing a guess.
+
+## [0.33.0] - 2026-10-07
+
+### Changed
+- **Both pushes now sit side by side, and the page is called Updates.** It was
+  called "Firmware" with the bitstream push buried in a separate card at the
+  bottom labelled "Write to flash", so there appeared to be no way to push a
+  bitstream at all. The Cards table now has, per card:
+  `firmware assigned | firmware running | push firmware (rust) | bitstream running (fpga) | push bitstream (fpga)`.
+  The nav entry and the page title agree, `/firmware` still resolves so existing
+  links keep working, and the two operations are explained apart beneath the
+  table — a firmware push reboots, a bitstream write does not and is live at the
+  next power cycle.
+- **The bitstream's version is shown as a version**, from colorlight 2.18.0's
+  structured `/api/bitstream`. A pre-2.17.0 bitstream reports no version at all,
+  which the row says plainly rather than inventing one.
+
+## [0.32.0] - 2026-10-07
+
+### Added
+- **The fleet view reports BOTH things a card runs, named apart.** A card runs two
+  separate artifacts and calling them both "firmware" is what made this confusing:
+
+  | | Firmware | Bitstream |
+  |---|---|---|
+  | what | the **Rust program** on the card's CPU | the **FPGA logic** (gateware) |
+  | lives | nowhere on the card — refetched over TFTP every boot | the card's SPI flash |
+  | live when | immediately, on reboot | at the next **power cycle** |
+  | version | a semver (`2.17.0`) | no semver — repo version + board + panel + outputs + clock + build time |
+
+  `/api/v1/firmware/running` now returns `version` **and** `bitstream` (read from
+  the FPGA by the firmware, via colorlight 2.17.0's `/api/bitstream`), plus
+  `bitstream_assigned` — what marquee recorded pushing. When those two disagree the
+  card has not been power-cycled since the push, which is the normal state right
+  after one and the only way to see it. The page title, column headers and Help all
+  name the two apart now.
+
+## [0.31.0] - 2026-10-07
+
+### Added
+- **Over-the-air FPGA BITSTREAM updates — the JTAG cable comes off.** Firmware
+  OTA (0.29.0) was the easy half: a card refetches `boot.bin` over TFTP on every
+  boot and keeps no copy. The *bitstream* lives in the card's SPI flash, and
+  until now replacing it meant attaching a programmer to a board that is usually
+  bolted behind a panel.
+
+  `POST /api/v1/bitstreams` stages a `.bit` — the 28-byte ASCII header is
+  stripped and the raw payload stored, because that is exactly what must land in
+  flash for the ECP5 to find a preamble, and the preamble is validated here
+  rather than after a card has erased its working image.
+  `POST /api/v1/cards/{id}/bitstream` tells the card to fetch it; the card
+  streams it into flash offset 0 one sector at a time (erase, program, verify)
+  and never buffers the whole image. The Firmware page does both in a browser.
+
+  Proven on hardware: 426,374 bytes, 105 sectors, written by the card itself with
+  no cable attached, after which it configured from the result — DONE high, no
+  BSE error, and the card came back reporting the pushed gateware.
+
+  Three things this deliberately does **not** do:
+  - **It does not reboot the card.** Writing flash does not reconfigure the FPGA,
+    so a reboot would restart only the firmware and would leave an operator
+    believing the new gateware was live. It becomes live at the next **power
+    cycle**, and the response says so.
+  - **It does not need a rollback.** A GOLDEN bitstream is written once over JTAG
+    and never again; if a pushed image does not configure, the ECP5 falls back to
+    it and the card returns on the network to accept another.
+  - **It refuses a card with no golden image**, because without a recovery image
+    a failed write is the one operation here that genuinely needs a cable.
+
+- **`cards.bitstream`** records which image a card was pushed, separate from
+  `cards.firmware`. Two artifacts, two update paths; one column could not answer
+  "what is this card running?". Alembic `d4e9c3f52a1b`.
+
+### Fixed
+- **A firmware push of a working image could report `back: false`.** The verify
+  waited for the card to go down and to come back on one shared deadline, so a
+  card that never appeared to go down consumed the whole budget and the
+  come-back loop never ran. The down-wait is now bounded separately.
+
+## [0.30.0] - 2026-10-07
+
+### Added
+- **Firmware page.** The OTA feature shipped in 0.29.0 as an API with no UI, so
+  the only way to stage, assign or roll out an image was curl. The page uploads
+  images, shows each one's size, sha256, fleet-default flag and which cards use
+  it, deletes the ones nothing needs, pushes an image to a card with a reboot,
+  and rolls one across a wall or the fleet.
+- **`GET /api/v1/firmware/running`** — per card, the image ASSIGNED next to the
+  version actually RUNNING. Those differ exactly when it matters: an assignment
+  nothing has rebooted into, or a card that fell back to the default image, and
+  a view showing only the assignment calls both of those fine. One call for the
+  whole fleet, because the browser generally cannot reach the cards — they sit
+  on the panel network that only the player host is on.
+  Needs colorlight **2.15.0**, which adds `version` to the card's
+  `/api/status`; it was previously rendered only into the card's HTML page where
+  nothing could read it. An older image answers without it, which the UI shows
+  as "pre-2.15.0" rather than as an error.
+
+### Fixed
+- **A firmware push could report success without rebooting.** The verify polled
+  for "does the card answer", and the old firmware kept serving HTTP in the
+  moment between accepting `/api/reboot` and actually restarting -- so
+  `back: true` could mean "never rebooted" and a push that had not taken effect
+  looked verified. Observed on hardware: a card answered with the previous
+  image's version immediately after a push. The endpoint now waits for the card
+  to go DOWN before waiting for it to come back, and reports `was_running`,
+  `now_running` and `went_down`.
+
+## [0.29.1] - 2026-10-07
+
+### Fixed
+- **A misspelled field in the firmware-assign body silently unassigned the
+  card.** `POST /api/v1/cards/{id}/firmware` took `firmware` with a default of
+  `None`, and FastAPI ignores unknown keys -- so a body naming the field
+  anything else (`{"name": "x"}`) was accepted, `firmware` fell back to `None`,
+  and the endpoint read that as "revert this card to the fleet default", then
+  rebooted the card into it and reported success. On a card whose gateware the
+  default image does not match, that turned a working card into a reboot loop
+  on a typo. `firmware` is now required (explicit `null` still means "back to
+  the default") and extra keys are rejected, so the same call returns 422
+  naming both problems. Same treatment for the rollout body.
+
+  Found while proving the feature on real hardware -- the response said
+  `"firmware":"boot.bin"` for a request that had named a different image.
+
+## [0.29.0] - 2026-10-04
+
+### Added
+- **Firmware OTA (RB-5554).** `/api/v1/firmware` lists, uploads and deletes
+  firmware images; `/api/v1/cards/{id}/firmware` assigns one to a card and
+  reboots it into that image, verifying it comes back; `/api/v1/firmware/rollout`
+  rolls an image across a wall or the whole fleet. Cards already netboot from
+  marquee, so updating one needs no JTAG and no hands -- what was missing was a
+  place to put images, a record of which card runs which, and a rollout that
+  checks rather than hopes.
+
+  Deliberate limits, each for a reason:
+  - **Upload never changes what the fleet runs.** Assignment is a separate
+    call, so staging a build cannot surprise anyone.
+  - **Rollout is serial and halts on the first card that does not return.** An
+    image that boots nowhere pushed in parallel turns a one-card problem into a
+    dark wall.
+  - **No automatic rollback.** A card that does not return is still netbooting
+    on every power cycle, so recovery is to reassign and reboot. Rolling back
+    automatically would mask a firmware that crashes late, which is worse than
+    a card that is visibly down.
+  - **It does not write the card's SPI flash.** Flash holds the bitstream, and
+    a bad bitstream is recoverable only over JTAG -- the dependency this
+    feature exists to remove. Bitstream OTA needs a golden slot and an atomic
+    pointer flip, and the card-side writer must read back what it wrote before
+    committing: a write-protected chip refuses an erase outright without ever
+    asserting BUSY, so every busy-poll returns instantly and every layer
+    reports success while nothing is written.
+- `python-multipart`, required by FastAPI for the upload endpoint.
+
+### Fixed
+- Deleting firmware now refuses the fleet default and any image still assigned
+  to a card, instead of leaving cards pointed at a missing file -- they would
+  silently fall back to the default on next boot. Found by the new listing,
+  which also surfaced a bench card still pointed at a leftover diagnostic
+  build.
+
+## [0.28.2] - 2026-09-21
+
+### Fixed
+
+**A documented example could not be pasted.** The `board_pages` example in
+`doc/providers.md` elided a dict with a bare `...`, which reads fine and is a
+`SyntaxError` when run. It now returns two real pages.
+
+### Added
+
+**A test that every ```` ```python ```` block in `doc/providers.md` actually
+imports.** A reference whose examples do not run teaches the wrong thing twice
+— once when they fail, and once when the reader assumes the rest is equally
+approximate. Proved to catch the defect rather than merely pass: restoring the
+bare `...` fails the test with `SyntaxError: ':' expected after dictionary key`.
+
+### Audited
+
+`doc/providers.md` was checked claim by claim against the code rather than
+against memory, the same way `colorlight`'s programmer's guide was in v2.12.1.
+Everything else held: the `Provider` contract is complete (the only
+undocumented members are loader internals — `discover`, `load_file`,
+`provider_dirs` — which are not part of the author-facing surface), and every
+behavioural claim verified — the 60s default interval, `_`-prefixed files
+skipped, `sys.path` restored after loading, later directories winning,
+malformed config JSON ignored rather than fatal, opt-out enablement, the
+five-minute backoff ceiling, both provider directories, both API routes with
+their `path` parameter and `binding`/`owner` fields, and the `{data:}`,
+`{bus:}` and `data_series` bindings.
+
+## [0.28.1] - 2026-09-20
+
+### Fixed
+
+**The clock pushed to a program-mode card was four hours off the train times
+beside it.** A card showed **21:07** in its corner next to a train leaving at
+**17:08**.
+
+The containers run **UTC**. Train times went through the board's own
+`ZoneInfo` and were correct; the clock came from the pusher's naive
+`datetime.now()`, which is container-local. Both numbers were on the same card,
+a centimetre apart, in different time zones.
+
+Two changes, because there were two ways to get it wrong:
+
+- **A board now supplies its own clock**, formatted in the same zone as the
+  times it is publishing. That is the zone that must match — a board watching a
+  railway in another timezone should show *that* railway's clock, not the
+  site's. The pusher `setdefault`s rather than assigns, so the board's wins.
+- **The fallback clock uses `MARQUEE_SITE_TZ`**, which marquee already records
+  and which was being ignored. This also fixes the same latent bug for
+  bus-driven programs such as `dashboard-home`, whose `hhmm` and `date` were
+  container-local too.
+
+A test asserts the pushed clock equals the board's own formatting of now, so a
+naive `datetime.now()` creeping back in fails rather than shipping.
+
+> Worth remembering how this survived a deploy: `custom/` is **mounted** into
+> the player but `services/player/` is **baked into the image**. `make restart`
+> reloaded the provider and kept the old pusher, so the fix looked like it had
+> not worked. Rebuild, don't restart — the rule holds even when part of the
+> tree is a mount.
+
+## [0.28.0] - 2026-09-20
+
+### Added
+
+**Providers can feed a card that runs its own program.** A card in
+`mode: program` is never sent a frame: it composes its own pixels from named
+values — a few hundred bytes a second against the ~24 Mbit/s a streamed card
+eats — and keeps showing the last ones when the host dies, marked stale. A
+provider now declares `PROGRAMS` and returns `board_pages(live)`.
+
+The rail providers feed **`railboard`**, the on-card departure board added in
+colorlight v2.12.0, so the Metro-North, LIRR and Amtrak boards now exist in both
+forms: streamed as shows, and composed on the card itself.
+
+**Values are selected BY PROGRAM, never merged.** The on-card table holds 24
+keys and `set()` **ignores** the 25th rather than evicting, so accumulating
+every source's values would silently drop whichever key went last — one column
+blank on the glass with nothing in any log to say why. The pusher reads which
+program a card runs from `cards.program` and sends only the pages of providers
+that declare it. The MODE is still asked of the card, which is the setting that
+must not be configured twice; the program NAME is marquee's own, served over
+TFTP, so the database is the source of truth.
+
+**The rotation is host-side**, for the same reason the page is a value at all:
+rows outside a program's `dynamic` band repaint only when a value arrives, so a
+card cycling on its own frame counter would redraw the whole canvas every frame.
+Derived from the clock rather than counted, so a pusher restart does not jump
+the sequence.
+
+### Fixed
+
+**Amtrak published station CODES where a sign wants names.** The footer read
+`NYP` and the line read `NYP-BOS`. Both are resolved from the feed's own call
+data now — it carries the code and the name on every stop — and the corridor
+label is configurable, because the honest description (`New York Penn - Boston
+South`) is 200px of a 128px wall.
+
+### Notes on shaping values for a card
+
+Three constraints the card imposes, all now in `doc/providers.md`:
+
+- **Send every key the program binds, every time.** A key left out keeps its
+  previous value on the card, so a short list leaves the last page's train
+  sitting under this page's heading.
+- **An empty string is indistinguishable from a key that never arrived** — the
+  card renders `-` for both, deliberately, because a program must never have to
+  decide what *absent* looks like. An empty row on a departure board is not
+  absent, it is "no train": push a space.
+- **Padding a name IS the instruction to scroll**, because the card decides by
+  measuring what it is given — and the padding has to carry its own gap, since
+  the scroll wraps. Do not pad to a power of two without checking: it lets the
+  card use a mask instead of a division, but `North White Plains` rounds from
+  18 characters to 32 and drags 112px of blank past a 56px window, so the
+  column reads as empty for most of the page it is on.
+
+## [0.27.1] - 2026-09-20
+
+### Added
+
+**`custom/example/shows/rail-rotation.yaml`** — all three rail boards in one
+show. Nine scenes, ten seconds each: a 90-second cycle giving each railroad
+half a minute. The single-system boards stay useful on their own; this is what
+a wall shows when it has no particular allegiance.
+
+**Two things change when a board joins a rotation**, and both are the same
+problem — a viewer arriving mid-cycle has no idea which railroad they are
+looking at:
+
+- the **header names the system**, not the scene. On its own board
+  `DEPARTURES` is unambiguous; in a rotation it could be any of three.
+  `METRO-NORTH` is 83px of the 93px header at size 10, `LIRR` 26 and `AMTRAK`
+  49 — measured, and the reason the header is not `MNR DEPARTURES`, which is
+  103px and clips.
+- the **scene type moves to the footer**, left, with the station on the right.
+  Measured too: `From Boston` needs 57px and `New York Penn` 68, which is 125
+  of a 124px footer — so the rotation calls it `Penn Station`, the same
+  building the LIRR row already names that way.
+
+Everything else — the `rows` layers, the column widths, the scroll settings —
+is unchanged from the single-system boards.
+
+### Fixed
+
+**A `rows` layer pointed at a bare topic draws nothing, silently.** The
+rotation was first generated with `data: "mnr.harlem"` instead of
+`data: "mnr.harlem|departures"`. The layer then reads the whole payload — a
+dict, not a list — and renders an entirely blank board. That is the documented
+behaviour for a path that is not a list, and it is correct: nothing raises,
+because a feed that is merely late must not take a sign down. It is also
+indistinguishable from a broken provider.
+
+A test now walks every `rows` layer in every shipped show and asserts its
+address carries a path, and that the path names a list the boards actually
+publish.
+
+## [0.27.0] - 2026-09-20
+
+### Added
+
+**Two more worked providers: the LIRR, and Amtrak between New York Penn and
+Boston.** Three now ship, over **two unrelated upstreams**, and the point is
+not that the plane holds three files — it is that a single example was hiding
+things that only a second and a third could show.
+
+All three publish the same payload shape, so the three shipped boards are the
+same show at the same column widths with the topic changed. That portability is
+a convention the providers keep rather than something the plane enforces, and
+it is the clearest statement of what a provider is for: absorbing the
+difference between upstreams so the show does not have to.
+
+**Providers can now share a helper module.** A file named `_*.py` was already
+skipped by discovery — documented as the way to keep machinery beside a
+provider — but it did not work: the import failed with `ModuleNotFoundError`
+because the plugin's own directory was not on `sys.path`. So the capability was
+promised and unusable, and two providers over one feed format had no choice but
+to duplicate the parsing. `load_file` now puts the directory on the path for
+the duration of the import.
+
+It **appends** rather than prepends, so the standard library always wins: a
+plugin directory containing `json.py` must not become the `json` module for the
+whole player. A test asserts exactly that.
+
+```
+custom/example/providers/
+  _board.py        presentation policy — how a time is written, when a
+                   countdown blanks
+  _gtfs_rail.py    GTFS-realtime protobuf + static GTFS
+  metro_north.py   \_ two configurations of _gtfs_rail
+  lirr.py          /
+  amtrak.py        a JSON API — shares _board only
+```
+
+The split is deliberate: **share presentation, not parsing.** What a viewer
+notices is the part that must not differ between boards in one rotation — one
+reading `Now` while the next reads `0m` is the sort of thing nobody files a bug
+for and everybody sees. A protobuf feed and a JSON API have nothing in common
+below the payload, and a base class that tried to unify them would be a pile of
+flags.
+
+### Fixed
+
+**The Metro-North vehicle join was right for Metro-North and would have been
+exactly wrong for the LIRR.** The two MTA feeds use opposite identity
+conventions, measured on both live:
+
+| | Metro-North | LIRR |
+|---|---|---|
+| join trip updates to vehicles on `FeedEntity.id` | **203 / 203** | **0 / 53** |
+| join on `trip.trip_id` | **0 / 203** | **53 / 53** |
+
+0.25.0 fixed a join that matched nothing by switching to the entity id, which
+was correct — for one of the two systems. Vehicles are now indexed under every
+identifier they carry and looked up by both, which is simply correct on either
+rather than a flag to get wrong. Without it every LIRR train reports
+`scheduled` with nothing in the log to say why.
+
+**LIRR train numbers were internal schedule ids.** Half its feed has no vehicle
+yet, and those rows fell back to `GO202_26_6158` — not something to put on a
+sign. Its realtime trip ids *are* static timetable ids, so `trips.txt` resolves
+a real number for them: 107/107, for 56 kB of cache. On Metro-North the same
+table resolves **0 of 201** and costs 1750 kB, so it is opt-in per system
+(`TRIP_NAMES`) rather than always on. `vehicle.label` is the timetable number on
+both systems and stays the first choice.
+
+**The LIRR board's footer read "Babylon Branch line"** — the feed's route name
+already ends in Branch.
+
+### Notes on the Amtrak board
+
+Amtrak publishes no public GTFS-realtime feed; its own endpoint returns an
+encrypted blob. This reads a free community JSON API instead, which is why it
+shares no parsing with the other two. It polls every **two minutes**, not
+thirty seconds: the response is the whole national network, about 1 MB, there
+is no endpoint that returns one corridor, and intercity trains do not move
+between stations in thirty seconds.
+
+What the richer upstream buys: scheduled *and* actual times per stop, so
+lateness is a subtraction rather than a guess, and a `platform` — which is
+usually **blank**, correctly, because Amtrak assigns a track at the last minute
+and the feed says so. A board that filled it in would be inventing it.
+
+Two layout decisions came out of measurement rather than taste. `Northeast
+Regional` is 98px of a 128px wall, so the provider publishes a short `service`
+name and the board shows *that* where the commuter boards show a destination —
+on a Penn-to-Boston board every departure goes to Boston, and Acela vs Regional
+is the choice a passenger is actually making. And this board **keeps** the
+train-number column the commuter boards drop: on the Harlem line a bare station
+name is unambiguous, but the Northeast Corridor runs Boston to Washington, so a
+row reading `Trenton 13:47` could belong to any of a dozen trains.
+
+## [0.26.0] - 2026-09-20
+
+### Added
+
+**A `rows` layer — a table, one row per entry of a list in the live cache.**
+
+```yaml
+- type: rows
+  data: "mnr.harlem|departures"
+  box: [1, 17, 126, 90]
+  row_height: 15
+  columns:
+    - {field: time,        w: 31}
+    - {field: destination, w: 63, scroll: auto, color: "#C9A84C"}
+    - {field: countdown,   w: 26, align: right, color: "#8899aa"}
+```
+
+**The row count comes from the data**, which is what a page of hand-written
+text layers cannot do. The Metro-North board shipped in 0.25.0 spelled its
+tables out as three text layers per row with the index baked into each path —
+18 layers a scene, 69 in the file — and that form has three faults: eight
+departures means writing six more layers rather than changing a number; moving
+a column 2px is eighteen separate edits; and **every row draws whether or not
+there is a train for it**, so a quiet hour rendered a column of no-value glyphs
+that read as data. The same board is now 18 layers total, and three trains draw
+three rows with the rest of the box dark.
+
+A row that exists but is missing one field still renders that cell's `—`. The
+row is real and the value is not, and hiding that would be a lie rather than a
+blank.
+
+Rows are capped by what fits (`box.h // row_height`), so the layer cannot draw
+outside its own box however long a feed grows; `limit` caps it lower. Columns
+flow left to right from accumulated widths, so changing one width shifts the
+rest. Cells are rendered by `_text` on a synthetic layer rather than by drawing
+in the new code — alignment and the continuous-scroll machinery (integer pixels
+per frame, the double draw, the wrap on text+gap) are subtle enough that a
+second copy would drift from the first, and on this board a scrolling cell sits
+directly beside a scrolling text layer.
+
+`sparkline` and `rows` both take `data` with `bus` as the older spelling.
+
+### Fixed
+
+**The Metro-North board clipped its time column to `13:4:` on the wall.** The
+show was imported into the database *before* its columns were re-measured, so
+the running copy still had `size: 11` in a 30px box where `13:42` needs 35.
+Re-imported. Worth remembering that editing a file under `custom/` does not
+reach a wall until `make shows-import` runs — the database is what the player
+reads.
+
+**Column widths are now measured rather than chosen by eye.** All 31
+Harlem-line station names were measured against candidate widths at each font
+size. Two results that were not obvious: the house font is DejaVu Sans **Bold**
+and far wider than it looks (at size 9 `13:42` is 29px of a 128px wall), and a
+train-number column on the "on the line" scene costs so much width that 77% of
+station names scroll — dropping it takes that to 93% static and the board goes
+from busy to calm. It is one line to put back, which is the point of the layer.
+
+**A scrolling column needs a real gutter.** A scrolling cell fills its whole
+width by definition, so at `col_gap: 1` the tail of a scrolling station name
+sat hard against the time beside it and the two read as one word.
+
+## [0.25.0] - 2026-09-20
+
+### Added
+
+**Data providers — a plug-in plane for live data.** A provider is a Python file
+that fetches something and publishes it on named topics; shows read it with
+`{data:topic|dotted.path}` bindings. Drop the file into a directory and restart
+— no registration step, no schema to declare, nothing to rebuild.
+
+```python
+class Tides(Provider):
+    name = "tides"
+    interval_s = 900.0
+    def poll(self):
+        return {"tides.next": {"high": "14:12", "low": "20:41"}}
+```
+
+The design decision worth recording is that a provider **writes into the same
+`LiveState` cache the panel-bus already wrote into**, so nothing downstream
+needed changing: `{data:...}`, `{bus:...}`, the `sparkline` layer, the preview
+path and `ValuePusher` all read topics and cannot tell the two writers apart.
+Adding the plane cost a writer, not a stack.
+
+Loaded from `custom/example/providers`, `custom/<site>/providers` and
+`/data/providers`, later winning — the `custom/` extension point the public
+release plan names, used for the second time and by the maintainers themselves.
+Config is settings-only (`provider.<name>.config`, JSON, merged over the class's
+`DEFAULTS`); a file beside the plugin would be a second place the same setting
+can live. Providers are **opt-out**: a file is only in that directory because
+somebody put it there.
+
+Failure is contained at every level, because the rule is the one bindings
+follow — a missing integration must never blank a sign. A file that will not
+import is skipped loudly and the others still load; `poll()` raising is caught,
+counted, and **the last good payload stays in the cache**; repeated failure
+backs off geometrically to a five-minute ceiling. Tests assert each of those
+rather than assuming them.
+
+`doc/providers.md` is the contract. ARCH.md §8 says why the plane is shaped
+this way.
+
+**`{data:topic|path}` bindings, and `sparkline: {data: ...}`.** The same read as
+`{bus:...}` against the same cache, under the name that is true now that the
+panel-bus is not the only writer. `{bus:...}` and `sparkline: {bus: ...}` keep
+working — breaking the scene language is not worth a rename — but write `data`
+in anything new. A sparkline must give exactly one of the two.
+
+**`GET /api/v1/providers` and `/providers/topics/{topic}`.** What is loaded,
+what it publishes, how stale each topic is, and the last error. The second
+answers the question that actually blocks a show author: knowing `mnr.harlem`
+exists does not tell you the path is `departures.0.destination`, so it returns
+the document and echoes back the exact binding string to paste into a show.
+
+**`LiveState` records which writer owns each topic.** Two writers on one topic
+present as a value *flickering between two plausible readings*, which is close
+to undiagnosable from the sign. Now a log line and an API field.
+
+**A Metro-North rail board — the worked example.**
+`custom/example/providers/metro_north.py` publishes trains departing a station,
+trains arriving into it, and every train already running on the line with its
+next stop and the time it reaches there.
+`custom/example/shows/metro-north.yaml` draws it as a three-scene paging board.
+
+It ships in the tree on purpose: the MTA's GTFS-realtime feeds are public and
+need no API key, so it runs out of the box, and it exercises the whole contract
+— working defaults, a slow-changing lookup table cached on disk, a fast feed on
+an interval, and a payload shaped for bindings rather than for the upstream.
+
+Two findings from building it, both recorded in the file:
+
+- **MNR puts two identifier spaces in one feed.** A `trip_update` carries the
+  GTFS trip id (`3209015`); the matching `vehicle` carries the train number
+  (`3030`). Joining on `trip_id` matches **0 of 203** — every train silently
+  reported "scheduled" instead of its real status. The `FeedEntity` id is the
+  join, and is also the number a passenger sees.
+- **Absent protobuf fields are not zero.** GTFS-realtime's `current_status`
+  defaults to `IN_TRANSIT_TO` (2), so a train with the field omitted is moving.
+  Defaulting it to 0 made a tenth of the fleet look like it was pulling into a
+  station it had left.
+
+It reads GTFS-realtime protobuf in ~40 lines of standard library rather than
+taking `gtfs-realtime-bindings`, because a provider that needs a `pip install`
+is no longer something you can drop into a directory. That is safe here
+specifically because the wire format is self-describing enough to walk without a
+schema, and the v2.0 field numbers have been fixed since 2011. Verified
+byte-for-byte against `google.transit.gtfs_realtime_pb2` on the live feed: 204
+trips, 2,625 stop-time updates, 204 vehicle positions, zero differences.
+
+The provider publishes a `countdown` field reading `"Now"`, `"7m"` or `""`
+alongside the raw `minutes`, because the scene language has no conditionals by
+design — so "blank it beyond an hour" has to be decided by the provider, and a
+board reading `117m` is a number no passenger has ever wanted.
+
+### Changed
+
+- The player now mounts `custom/` (read-only). It did not before; providers are
+  loaded from there.
+- `ValuePusher` starts when **either** a bus URL or a provider is configured. It
+  was gated on `MARQUEE_BUS_URL` alone, which would have left program-mode cards
+  unfed on an install that uses providers only.
+
+## [0.24.0] - 2026-09-20
+
+### Added
+
+**A test that the wire constants agree with the panel firmware.** `test_wire.py`
+checked this side's arithmetic against literals in the same file, which cannot
+catch the failure that matters: the firmware defines the same constants
+independently, in Rust, and when they drift the symptom is a **sheared image**
+rather than an error — nothing raises, nothing logs, every packet looks valid.
+
+Four assertions read `bitmap_udp.rs` directly: the header size, `PIXELS_PER_CHUNK`,
+`PIXELS_PER_CHUNK_INDEXED`, and that the firmware is self-consistent —
+`MAX_PAYLOAD / 3` equals its own documented 487, indexed is exactly 3× that, and
+`MAX_PAYLOAD` is *not* divisible by 3, which is the whole reason the indexed size
+is `3 × 487` rather than 1462.
+
+Proved to catch drift rather than merely pass: mutating the firmware's `// 487`
+to `// 486` fails two of the four.
+
+`make be-test` now mounts the firmware, because these skip without it and a
+skipped test is not a test. `FIRMWARE` defaults to `../firmware`.
+
+### Fixed
+
+- `check_shows.py` hard-coded an internal bus hostname; it takes `MARQUEE_BUS_URL`
+  from the environment with no host default, since the bus is site infrastructure.
+- The nginx comment and a changelog entry named an internal host and another app
+  while explaining why `/marquee` must redirect. The reason is general; those are
+  not.
+
+## [0.23.0] - 2026-09-19
+
+### Added
+
+**The Content editor now says what it is about to change.** Four gaps, all of
+which let you act without the information you needed:
+
+- **File/database drift is visible.** Files under `custom/<site>/shows/` are the
+  source of truth and the database is what the player reads, but nothing keeps
+  them in step — and the UI never said so. `GET /shows/files` reports `in-sync` /
+  `db-newer` / `file-newer` / `no-file` per show, plus files on disk with no row
+  at all, which were previously invisible and so looked like a show that did not
+  exist. Export and import buttons do what the Makefile targets do.
+- **Shows carry `walls[]`**, and the editor names them: *live on bench — saving
+  changes what is showing*. You could previously rewrite a live wall believing
+  you were editing a draft.
+- **`POST /shows/validate` is wired up**, debounced as you type, reporting
+  scenes, duration, size, fps and format — or the parse error. It already
+  existed and nothing called it, so a malformed document was found by the
+  preview failing or the save being rejected.
+- **A real editor**: line-number gutter, YAML highlighting, and Tab that indents
+  instead of leaving the field. No editor dependency — a highlighted `<pre>`
+  behind a transparent `<textarea>`, so native editing, selection and undo are
+  untouched.
+
+### Changed
+
+- `MARQUEE_SITE` (default `dashboard`) selects which `custom/<site>/shows`
+  directory the UI exports to and imports from, mirroring the Makefile's `SITE`.
+
+## [0.22.1] - 2026-09-19
+
+### Changed
+
+**`dashboard-home` streams `format: indexed` again.** It was `rgb` because the
+card's palette was single-buffered while the framebuffer was gateware-swapped,
+so a palette that changes — which is any scene with a clock in it — showed as
+colour artifacts once per change. That is fixed in colorlight v2.7.0 (RB-5516):
+the palette is two banks selected by the same signal the framebuffer follows.
+
+Indexed buys roughly 3x the packet rate, which is what makes the nine-panel
+P1.25 wall possible. On this one-panel wall either format works — rgb sustains
+30 fps at 128x128 with zero drops — so the `display:` line is the only change
+needed to go back.
+
+Requires colorlight v2.7.0 **flashed as a bitstream**, not just firmware. An
+older bitstream reports no palette banks, the firmware falls through to the
+single-bank path, and the original artifact returns.
+
+## [0.22.0] - 2026-09-19
+
+### Added
+
+**The values an on-panel dashboard needs.** A panel in `mode: program` composes
+its own pixels and never receives a frame, so everything it draws has to arrive
+as a named value. Adds `humidity`, `power`, `gallons`, `nextzone`, `zones` and
+`running` to the mapping, plus three values the panel cannot work out for
+itself:
+
+- `hhmm` and `date` — the panel has no RTC and `ctx.time_ms` is uptime.
+- `hist` — the power trace, encoded by `encode_series()` as 60 ASCII bytes
+  scaled to the series' own min..max. One byte per sample means a trace column
+  is a single index on the panel; sending `"43.2,42.8,.."` would mean parsing
+  floats per pixel on a core with no FPU, which is a frame-rate cut rather than
+  a style choice.
+- `page` — which of the four pages is showing.
+
+The page is pushed rather than cycled on the panel, and that is a deliberate
+trade. Cycling on `ctx.frame` makes the whole canvas change between frames, so
+every row must be redrawn every frame; the platform's answer is that rows are
+repainted **when a value arrives**, so the page has to be a value. If marquee
+dies the cycling stops, but the glass keeps its last values and raises the stale
+marker — which is the thing a streamed panel structurally cannot do, because it
+freezes on a frame that looks perfectly correct forever.
+
+Needs colorlight v2.6.0 on the card: `hist` is 60 bytes and the card's value
+slots were 24, and the table held 16 keys against the 16 this pushes.
+
+## [0.21.0] - 2026-09-19
+
+### Fixed
+- **A film change stalled the whole wall for 3 to 9 frames.** Opening a
+  multi-gigabyte file and initialising a decoder costs **131–434 ms measured**,
+  and the render loop is single-threaded — so every transition was paid on the
+  frame deadline and the picture froze and jumped.
+
+  The next film's decoder is now opened **while the current one is still
+  playing**, and the transition is a swap. Measured: spawning even 0.5 s early
+  takes the first read from 120–469 ms to **0.1 ms**, and more lead does not
+  help — so there is nothing to tune.
+
+  Through the real code path, 10 transitions in 20 s of playback: worst frame
+  **0.73 ms** (`cover`) and **0.91 ms** (`smart`), against a 50 ms budget, with
+  **zero** frames over it.
+
+- **`fit: smart` was running ffprobe on the render thread.** Introduced in
+  0.20.0 and only visible once the transition stall was removed: building a
+  decoder costs 0.3 ms at `fit: cover` and **110–483 ms at `fit: smart`**,
+  all of it ffprobe. Now cached per file (dimensions do not change) *and* moved
+  to the pre-warm worker, so neither a cold probe nor ffmpeg startup touches
+  the render loop.
+
+- `next_frame()` **never blocks**. If a film ends before the next is open it
+  holds the final frame for that tick rather than waiting on ffmpeg — a held
+  frame is a held frame, a blocked loop stalls the whole wall. Only reachable
+  on a cold start.
+
+- `close()` releases the pre-warmed decoder too; it is a live ffmpeg, and
+  leaking it leaked a process and a file handle per show change.
+
+## [0.20.0] - 2026-09-19
+
+### Fixed
+- **`fit` was ignored on every video layer.** `VideoDecoder`'s ffmpeg filter
+  chain was hard-coded to `force_original_aspect_ratio=increase,crop=w:h` — a
+  cover crop — so `contain` and `smart` were accepted and silently did nothing,
+  and every video was cover-cropped whatever the show said. The framing has to
+  happen in ffmpeg (the decoder reads a fixed number of bytes per frame, so
+  what comes out is already final), and it now builds the chain from the
+  layer's `fit`. Six tests pin it.
+
+### Added
+- **Fractional boxes and wall-native rendering** — one show, many walls. Omit
+  `display.width`/`height` and write boxes as fractions (`0.5`, `"50%"`), and
+  the player renders at the wall's own size instead of rendering small and
+  resizing. A 128x128 show on a 768x384 wall used to be stretched 6x across and
+  3x down. An int is always pixels and a float always a fraction, so `1` and
+  `1.0` differ; booleans are rejected rather than quietly becoming 1px.
+  Absolute boxes are unchanged.
+- **`fit: smart`** — zoom a bit, and centre, decided from the two shapes rather
+  than a number typed into a show that would be wrong on the next wall. Fills
+  the box when `cover` would crop 15% or less; otherwise takes the geometric
+  mean of the contain and cover scales, the one scale where crop and letterbox
+  are exactly equal. Measured on one 16:9 film: 25%/25% on the square bench
+  wall instead of 44% either way, and a clean fill on 128x64 and 768x384.
+- `home-movies` is now wall-agnostic: no declared size, full-wall fractional
+  box, `fit: smart`.
+
+## [0.19.0] - 2026-09-19
+
+### Fixed
+- **Switching a card to program mode did nothing to the board.** It updated the
+  database and the card's TFTP config and stopped there, so the card carried on
+  doing whatever it was already doing until someone power-cycled it. The UI
+  said `program: dashboard` while the board reported `running: false` — and
+  because the player skips program-mode cards, nothing streamed to it either.
+  The panel sat on a stale frame looking like a working sign.
+
+  Mode and program are now pushed to the board when you change them. The boot
+  config is still the record of intent and still what a cold card reads; this
+  just makes the change take effect when you make it. If the board cannot be
+  reached the API says which ones, rather than implying it worked.
+- **Dead programs are restarted.** A program-mode card that is not actually
+  running its program is an invisible failure: stale frame, nothing streaming
+  to it, looks healthy. The player now checks each program-mode card every poll
+  and starts the right program if it is stopped or running the wrong one —
+  the same treatment the pixel DMA already got. Verified by stopping a program
+  behind marquee's back and watching it come back within a poll.
+
+### Changed
+- **One content control, covering both kinds.** Content used to mean "a show",
+  with programs set per card on a different page — an implementation detail
+  leaking into the UI, since both answer "what is on this wall?".
+  `GET/PUT /walls/{id}/content` lists and sets both, and **mode is no longer
+  something you set**: choosing content is the mode decision, so the separate
+  control added in 0.18.0 is gone.
+
+  The two are not the same operation and the options say so. A show is rendered
+  once and each card gets its crop — one picture across N cards. A program runs
+  **on** each card from that card's own width and height (the firmware's
+  program context carries `w`, `h`, a frame counter and values — no wall size,
+  no origin), so N cards run N independent copies. The list labels this, and a
+  multi-card wall says plainly that it is N displays rather than one picture.
+
+  Programs offered for a wall are the **intersection** across its cards: one
+  firmware carries every program and two cards need not run the same build, so
+  a program only one card has is not something the wall can show.
+
+  Per-card mode remains as an override, for the case it exists for.
+
+## [0.18.0] - 2026-09-19
+
+### Added
+- **`make shows-check`** — renders every scene of every show and reports what
+  is broken. Exists because "did that renderer change break a show?" is not
+  answerable by reading: a show is YAML plus ffmpeg plus whatever the bus was
+  serving, and the failure modes are deliberately silent — a layer that errors
+  is caught and skipped so a broken integration never blanks a sign, which is
+  right at runtime and useless when hunting a regression. Exits non-zero on a
+  real failure, so it can gate a release.
+- **A wall-level mode control.** Choosing content for a wall says the wall
+  shows that picture; a card running an on-board program does not. Acting on
+  that used to mean opening every card in turn — nine clicks on a nine-card
+  wall to say one thing — and the Walls page did not even show that some cards
+  were ignoring the content. `POST /walls/{id}/mode` sets every card at once,
+  the Walls page shows the wall's mode, and a disagreement is named: *"bench
+  runs an on-board program and will not show this content."*
+
+  **Mode stays a per-card column and that is deliberate.** A program-mode card
+  still has its pixels when the host dies, so one board can keep showing
+  something true while its neighbours hold a frozen frame that looks perfectly
+  healthy. The wall owns the bulk verb; the card keeps the override.
+- `GET /walls/{id}/layout` returns a `mode` rollup — `stream`, `program`, or
+  `mixed`.
+
+### Fixed
+- `video-test` rendered **all black**. Not a fault: `start: 600` seeks to a
+  genuinely dark passage of the film, so the throughput numbers were fine but
+  the panel showed nothing and the test looked broken every time. Seeks to
+  1800s now, where there is picture, so it doubles as a visual check.
+- Source errors are tagged `source:` in `Renderer.errors`, so a missing
+  camera/Wowza/download (this install's configuration, true forever on a
+  machine with no cameras) is distinguishable from a code fault. Without it any
+  gate cries wolf permanently.
+
+### Checked
+All 18 shows render. No regressions from the renderer changes in 0.16/0.17.
+Three shows report unconfigured sources — no cameras registered, no
+`wowza_base`, YouTube blocked upstream — and all three still render lit, which
+is the designed behaviour.
+
+## [0.17.0] - 2026-09-19
+
+### Added
+- **`random:` source** — picks independently every time, so a film can come
+  round again before the others have played. That is what random means, and it
+  is what the bench wall's `home-movies` show now uses.
+
+  `shuffle:` stays, with the same argument, for drawing without replacement.
+  Which to use is taste, not correctness: with a few hundred films `random:`
+  repeats sooner than most people expect (the birthday problem, not a fault),
+  and `shuffle:` guarantees every film before any repeat. Swapping the scheme
+  is the only change needed.
+
+  Neither will play the same film twice **back to back**. In `random:` that is
+  a 1-in-N event which reads as a stuck picker rather than as luck, so it is
+  excluded; nothing else about the choice is constrained.
+
+## [0.16.0] - 2026-09-19
+
+### Added
+- **`shuffle:` source** — `src: "shuffle:Home Movies"` plays one film to its
+  end, picks another at random, forever. Scope to a folder with
+  `shuffle:Home Movies/2019`.
+
+  The randomness had to live in the **layer**, not the timeline: `scene_at()`
+  is a stateless function of show-time, so a random source there would re-roll
+  on every frame. A `shuffle:` layer owns its own clock, which means the
+  scene's `duration` has no effect on what you see.
+
+  A shuffled **bag** rather than an independent pick each time — with 339 films
+  an independent pick repeats far more often than people expect, and a repeat
+  inside ten minutes reads as a bug. Every film plays before any repeat, and
+  the join between two bags never replays the same film back to back.
+- **`home-movies` show** for the bench wall: the whole library, at random,
+  `format: rgb` (video is the worst case for 256 colours, and a per-frame
+  palette is exactly what triggers the colour-artifact bug).
+- `Resolver.pool()` — every video under a library, sorted, with the same
+  containment check as `plex:`. Skips DFS replication bookkeeping
+  (`DfsrPrivate`, `__DFSR_DIAGNOSTICS_TEST_FOLDER__`, dotfiles, `._` stubs);
+  `/share/homemovies` carries several of those beside the real folders.
+
+### Changed
+- `VideoDecoder.ended` — a finished file was previously indistinguishable from
+  a stalled one, since both just keep returning the last frame. Nothing above
+  could tell that a film had ENDED.
+
+### Verified
+339 films discovered with no junk; real ffmpeg decode confirmed; end-of-file
+advancement proven with three 1-second clips — 10 plays, 3 distinct films, each
+clip lasting exactly its length. 11 new tests.
+
+## [0.15.0] - 2026-09-19
+
+### Added
+- **Colour order is now a per-card setting** — `RGB RBG GRB GBR BRG BGR`,
+  chosen on the Cards page and served to the card in its boot config. In
+  v0.14.0 the UI could only tell you this did not exist; colorlight v2.4.0
+  added the gateware CSR and this is the control for it.
+
+  The IC and the panel's own wiring decide which logical colour each HUB75 pin
+  group carries. Get it wrong and the hues are wrong while **every counter on
+  the card stays clean** — there is nothing in the statistics to find, which is
+  what made it expensive before there was a setting at all.
+
+  Per card, like the driver chip and for the same reason: all of a card's
+  outputs run in lockstep off one engine, so there is one order for the board.
+- The panel detail popover shows the order in force alongside the driver chip,
+  and points at the card's own `/api/rgborder` for trying one live. Finding the
+  right order is a look-and-see job; the card takes it instantly over that API,
+  and this setting is where the answer is recorded so it survives a reboot.
+- `GET /rgb-orders`, mirroring `RGB_ORDERS` in the firmware's `layout.rs` and
+  the gateware CSR — same order, and the index IS the CSR value.
+
+### Changed
+- `cards.rgb_order` column (migration `c3d8b2e41f09`). Nullable, no default.
+  Empty **and the literal `RGB`** mean the standard order and are not written
+  into the boot config at all, so every existing card's config is
+  byte-identical to before the column existed. Upgrade and downgrade both
+  tested against the live database with the card record intact.
+
+## [0.14.0] - 2026-09-19
+
+### Added
+- **Click a module for its hardware detail** (Cards page): connector, module
+  size, grid position, and the driver chip in force. The panels drawn in
+  v0.13.0 were read-only shapes; now they answer questions.
+- The detail states two things the UI previously left implicit:
+  - **The driver chip is set per CARD, not per module, and that is not an
+    oversight.** The IC is physically on the module, but the gateware shares
+    ONE register table across all of a card's outputs, so a card cannot drive
+    two chip types at once — every module on a card must carry the same IC.
+    Someone about to mix modules now reads that where they are looking.
+  - **There is no per-module colour mapping.** RGB channel order is fixed by
+    the bitstream (the board pin map plus `hub75.py`), with no runtime remap in
+    gateware, firmware or here. Saying so beats letting someone hunt for a
+    setting that does not exist — `panel-check`'s RGBW swatches detect a wrong
+    channel order but nothing can currently correct it.
+
+## [0.13.0] - 2026-09-19
+
+The UI showed cards but never the **panels plugged into them**.
+
+A card is one receiver board; the modules hanging off its connectors are a
+different thing, and nothing in the UI said how many there were or what size.
+The bench card read `128×128` and the two 128×64 modules making that up
+appeared only as raw YAML inside the edit form — so "is this one panel or two,
+and which connector is the top one?" could not be answered by looking at the
+app.
+
+### Added
+- **Panel map on every card** (Cards page): the modules drawn to scale from the
+  card's own `layout_yaml`, labelled by connector, with a summary line —
+  `2 panels · 128×64 each · J1 J2`. Always visible, not hidden behind the edit
+  pencil. Parsed from the same YAML the card is served at boot, so it cannot
+  drift from what the board will actually do.
+- **Module seams in the wall map** (Walls page): a card rectangle is no longer
+  drawn undivided. Dashed lines mark where one module ends and the next begins,
+  and the tooltip says how many modules are on that card. Drawn with
+  `pointer-events: none` so they never interfere with dragging.
+
+### Changed
+- `GET /walls/{id}/layout` now returns each card's `layout_yaml`, which is what
+  the wall map needs to place the seams.
+
+## [0.12.2] - 2026-09-19
+
+### Fixed
+- `host-nginx/marquee.conf` had no `location = /marquee` redirect, so a bare
+  `/marquee` fell through to the host's catch-all. Where that catch-all
+  belongs to a different app, `/marquee` silently rendered
+  **another app** rather than 404ing — which reads as Marquee being broken when
+  it was simply never reached. Added the 301.
+
+### Deployed
+- Marquee is now on the the build host Homepage dashboard and served at
+  `https://the build host.example.com/marquee/`. `host-nginx/marquee.conf` already
+  existed and had never been installed on the host; it is now symlinked as
+  `/etc/nginx/conf.d/_marquee.inc` and included from the build host's server block, so
+  the routing stays versioned in this repo. The tile is `type: link` rather
+  than a Homepage `type: proxy` tile because only `= /`, `/admin/` and
+  `/assets/` reach that container on the build host (homepage v1.15.0).
+
+## [0.12.1] - 2026-09-19
+
+### Docs
+- **Per-card firmware over TFTP now works**, on colorlight v2.3.0 or later.
+  That BIOS derives its MAC from the card's flash unique ID and does its own
+  DHCP, so `boot.bin` is requested from the card's own reserved address and
+  `tftp_resolve`'s lookup by host succeeds. Measured on the bench card: the
+  request moved from `192.168.1.50` to `192.168.1.70`, and the log went from
+  `identified as bench ... via ARP` to a direct hit.
+
+  `README.md`, `ARCH.md` and the docstring on `_mac_for_ip()` all stated flatly
+  that this was impossible and that staged rollout meant flashing. That was
+  true of every bitstream before today and is now wrong for anything current,
+  so all three say which side of v2.3.0 they mean. Nothing in the code changed:
+  the ARP fallback stays, because cards on older bitstreams still netboot from
+  one shared address.
+
+## [0.12.0] - 2026-09-19
+
+The bench wall now runs a real home information display.
+
+### Added
+- **`sparkline` layer** — plots a numeric series the panel-bus has already
+  pushed (`{type: sparkline, bus: "home.status|power.history"}`). Same drawing
+  code as `graph`, different source. `graph` needs `ha.base_url` and `ha.token`;
+  this install has only the base URL, so every `{ha:...}` renders the no-value
+  glyph and every `graph` comes up empty. The bus carries the same facts, is
+  already subscribed, and costs the render path no network call — which is the
+  house rule for something redrawing 20 times a second. Non-numeric entries and
+  booleans are dropped rather than plotted as zero: a `null` drawn as zero is a
+  cliff to the floor that reads as real data.
+- **`dashboard-home` show** — four scenes on the 128x128 bench wall (time and
+  weather, security, power with a live load sparkline, irrigation), all off
+  `{bus:home.status|...}`.
+
+### Fixed
+- The player no longer manages the card's hardware pixel filter. That
+  workaround turned the filter off so palettes could reach the CPU, and turning
+  it off also turns off the gateware buffer swap (they share one call in the
+  firmware) — so the DMA wrote into the buffer being displayed. It traded a
+  colour bug for a worse one. The real fix shipped in colorlight v2.1.0: the
+  classifier spares the palette magic, so the filter stays on.
+
+### Fixed (build)
+- `make be-test` was permanently red: `tests/test_multicard_stream.py` imports
+  `player.player`, and the api image ships `app/ alembic/ scripts/ tests/` only,
+  so those two tests could never pass there. The suite now runs in the player
+  container, which carries both `player` and `marquee_core`. 36 passed.
+
+### Known issue
+- **`format: indexed` shows colour artifacts on any scene with a clock or live
+  data in it.** The palette is single-buffered on the card while the
+  framebuffer is double-buffered and gateware-swapped, so the indices and the
+  palette on screen can belong to different frames. Every counter stays clean
+  while it happens. Tracked as RB-5516; `doc/scenes.md` carries the warning
+  beside the benchmark that makes indexed look unconditionally better.
+  Prefer `rgb` where it fits — at 128x128 it sustains 30 fps with zero drops.
+
+## [0.11.0] - 2026-09-19
+
+One picture may now span more than one receiver card. **`Panel` is split into
+`Wall` and `Card`.**
+
+### Added
+- **`Wall`** — a logical display: a name, a pixel size, and the show assigned to
+  it. **`Card`** — one receiver board driving a rectangle of a wall, with an
+  `x`/`y` origin within it.
+
+  A panel used to be both, which held for exactly as long as one board could
+  drive a whole display. It cannot, for three reasons that all arrive together
+  on a fine-pitch wall:
+
+  | Limit | Value on current hardware |
+  |---|---|
+  | Output connectors per receiver | typically 8 — a nine-module wall needs two boards |
+  | Framebuffer | 327,680 px, about ten 256x128 modules |
+  | Memory bandwidth | sets refresh: 36.8 Hz for nine modules on one card, **49.1 Hz split across two** |
+
+  The third is the one worth noticing: splitting a wall does not merely make a
+  bigger wall possible, it makes the wall **faster**, because each card only
+  reads its own region out of memory. That is how commercial LED systems scale
+  too — by adding receivers rather than building bigger ones.
+
+- **One render, N crops.** `WallPlayer` draws the whole canvas once per frame
+  and sends each card `canvas.crop(card.box)`. Cheaper than rendering per card,
+  and the only way two boards stay in step: they are handed the same frame, from
+  the same render, in the same pass. Rendering twice would put two independent
+  frame clocks on one picture.
+
+  **Nothing in the firmware or the wire protocol changed.** A card receives a
+  frame sized to its own region and has no idea it is part of anything larger,
+  which is why this works identically for the HUB75 boards running today and for
+  newer S-PWM hardware.
+
+- **`GET /walls/{id}/layout`** reports gaps, overlaps and overhangs rather than
+  rejecting them — an operator mid-edit will briefly have all three. The Walls
+  page draws the wall to scale with each card's rectangle on it, because these
+  failures are geometric: a gap is a black band on the glass and an overlap is
+  two boards rendering the same pixels, and neither reads as a coordinate error
+  when you are standing in front of it.
+
+- **Walls and Cards pages**, replacing Panels. Content is set on the wall;
+  boards, modes and health on the card. A streaming card shows which wall it
+  belongs to and links there rather than offering a second, conflicting place to
+  set the show.
+
+### Changed
+- Assignments and schedules moved from the card to the **wall**. Every board
+  covering one picture must play the same show, and making that a property of
+  the wall removes the possibility of them disagreeing. Stats stayed **per
+  card** — on a two-card wall it is exactly the difference between the two
+  series that says which board is struggling. Mode stayed per card too, so one
+  board can run an on-board program while its neighbours stream.
+- `panels` -> `cards`, `panel_stats` -> `card_stats`, `PanelStream` ->
+  `CardStream` (the old name is kept as an alias).
+- Every doc updated to use the two words precisely: `ARCH.md` gains section 2a,
+  and the in-app Help gains a "Walls and cards" section.
+
+### Migration
+**Lossless, and single-card installs are a no-op.** Every existing panel becomes
+a one-card wall of the same name and size at (0, 0), so nothing has to be
+reconfigured. Verified against a copy of the live database, including a full
+up-down-up round trip.
+
+The downgrade needed fixing after it was actually run. `batch_alter_table`
+rebuilds a table from a reflection taken at entry, so an index still in that
+reflection is recreated against a column dropped in the same batch — it failed
+with "no such column: wall_id" and left the database stranded halfway. Dropping
+the index first fixes it, and running the downgrade rather than assuming it
+worked is how it was found.
+
+### Compatibility
+`POST /api/v1/play` still accepts `panel` and resolves it by wall name and then
+by card name, so other homelab apps calling it keep working; the response echoes
+both keys. `GET /api/v1/panels` remains as a deprecated alias for `/cards`.
+
+## [0.10.0] - 2026-09-16
+
+### Added
+- **`custom/` — an extension point, and shows as files.** Shows existed only as
+  rows in an untracked SQLite file: no review, no history, no backup, and no way
+  to ship a starting set with the project. A disk failure lost them.
+
+  ```
+  custom/README.md        what goes here                 SHIPS
+  custom/example/shows/   a worked example               SHIPS
+  custom/<site>/shows/    your shows                     NEVER SHIPS
+  ```
+
+- **`make shows-import` / `make shows-export`** (`SITE=` selects the directory).
+  Import is **idempotent** — it only writes rows whose content actually changed,
+  so re-running it is how a file edit reaches a panel. Export brings a change
+  made in the web UI back into version control.
+
+  A show file is a normal scene document with an optional `# name:` header
+  comment. No header means the filename is the name, so a file dropped in by
+  hand imports without ceremony rather than being silently skipped.
+
+  All 16 existing shows exported, and the round trip verified: re-importing
+  reports `0 created, 0 updated`.
+
+### Documentation
+- README, `ARCH.md` and the Help page cover where shows live and the
+  files-vs-database split. The same division applies across the two repos:
+  **runtime content here, build-time inputs in the firmware's `custom/`.**
+
+## [0.9.1] - 2026-09-15
+
+### Added
+- **`LICENSE` — BSD 2-Clause.** There was none. Without a licence file, default
+  copyright applies and nobody has permission to use, copy or modify the code,
+  whatever a badge says.
+- **`THIRD-PARTY.md`.** Nothing is vendored here, so this is mostly a dependency
+  list — but it records the one thing that actually bites: Marquee **invokes**
+  ffmpeg as a subprocess and does not link it, so this project's licence is
+  unaffected by which ffmpeg is present. A distributed **image** is different,
+  because it bundles one, and ffmpeg is LGPL or GPL depending on how it was
+  compiled.
+
+## [0.9.0] - 2026-09-15
+
+### Changed
+- **`MARQUEE_BUS_URL` and `MARQUEE_BUS_TOPICS` no longer default to a specific
+  deployment's bus.** They were hardcoded to one site's websocket URL and its
+  local feed names, so any other install would have retried a host that is not
+  theirs, forever. Unset now means the live-data plane is simply **off** —
+  bindings render the no-value glyph and nothing else changes. Both are
+  documented in `.env.example`, and ours are set in `.env`, so nothing moves
+  here.
+
+  A missing integration must never blank a sign; an unreachable *default* is the
+  same rule applied to configuration.
+
+- `make push` checks for an `origin` remote rather than naming a specific
+  canonical host.
+
+### Fixed
+- Docstrings, an HTTP-binding example, a camera placeholder in Settings and two
+  documents no longer name internal hosts.
+
+### Notes
+These are the nine violations the publish generator refused on
+(`doc/PUBLIC-RELEASE-PLAN.md` §5a). Fixed as **real edits** rather than
+publish-time substitutions: a transform that rewrites a hostname in a sentence
+still leaves a document describing somebody else's network, and the default was
+a genuine bug for anyone who is not us.
+
+## [0.8.1] - 2026-09-15
+
+### Documentation
+- **The rule, stated plainly everywhere it matters: once a Colorlight card is
+  programmed, Marquee is all you need.** Nothing in the colorlight repo runs at
+  runtime — it builds gateware and firmware, compiles on-panel programs and
+  flashes boards. Marquee serves boot, config, pixels, values and stats.
+
+  Added to the README, `ARCH.md` and the Help page (searchable under "what do I
+  need running?"). The boundary is the useful part: switching a panel between
+  programs its firmware already carries is a change *here*; adding a new program
+  is a firmware build *there*.
+
+- Recorded that **netboot takes precedence over flash** — while Marquee is
+  reachable, the image Marquee serves is the one that runs, and a flashed image
+  is the fallback. That is why `./build.sh deploy` rather than re-flashing is how
+  a networked fleet is updated.
+
+## [0.8.0] - 2026-09-15
+
+### Fixed
+- **`tftp_resolve` was never called for `boot.bin`.** tftpy was given
+  `/data/firmware` as its root, and its RRQ handler serves a static file if one
+  exists, consulting `dyn_file_func` **only when it does not**:
+
+  ```python
+  if os.path.exists(path):          # <- static file wins
+      self.context.fileobj = open(path, "rb")
+  elif self.context.dyn_file_func:
+  ```
+
+  `boot.bin` exists there, so every panel got it straight off disk and the
+  `firmware` field on a panel record did nothing at all. `<mac>.yml` worked
+  *because no such file exists on disk* — which is exactly what made this look
+  like a database lookup bug for months rather than a routing one. tftpy now
+  gets an empty root and every request goes through the resolver.
+
+- **The firmware handoff is no longer silent.** Every served image is logged
+  with its name, size and the panel it was for. A panel booting the wrong
+  firmware shows nothing on the wire and nothing on the glass.
+
+### Added
+- **MAC identity via ARP** when the host lookup misses. The player runs with
+  host networking, so `/proc/net/arp` is the host's table and holds the sender's
+  MAC.
+
+  It does not currently succeed, and the reason is now visible instead of
+  hidden: the BIOS fetches `boot.bin` **before DHCP**, using the gateware's own
+  IP and MAC — **both compile-time constants shared by every panel built from
+  that bitstream** (`eth_mac_address = 0x10e2d5000001`). So the request carries
+  no panel identity at all. The fallback is now loud —
+  `not identified (arp=10:e2:d5:00:00:00); serving default firmware` — which is
+  what made the root cause diagnosable. Staged rollout is a **flashing**
+  operation; see colorlight TODO item 8.
+
+## [0.7.1] - 2026-09-15
+
+### Added
+- **Help covers standalone panels.** A panel's firmware can now carry its own
+  layout and program, so three entries were missing: what wins at boot, what a
+  standalone panel is, and that an offline panel has **no data** — every key
+  reads as a dash, so a program meant to run offline must be written for that.
+- **Troubleshooting: "a panel came up as one small panel, not the full wall".**
+  That is a panel with no layout — either marquee served none (the player log
+  says `no layout for <mac>.yml`) or it booted with no network and nothing baked
+  into its firmware, and fell back to a single panel expecting a stream.
+
+### Documentation
+- **Boot precedence written down** in README and ARCH: the TFTP config marquee
+  serves **always wins when it answers**, then the panel's compiled-in default,
+  then a bare single panel. A standalone panel is not a special case that
+  escapes management — point it at marquee and marquee takes over.
+
+## [0.7.0] - 2026-09-15
+
+### Added
+- **A real help system in the web UI.** The Help page was nine paragraphs
+  written before on-panel programs existed; it is now seven categories —
+  Concepts, Content, Panels, On-panel programs, Integration, Troubleshooting,
+  Reference — browsable by category and searchable across all of them at once.
+
+  **Troubleshooting is symptom-first**, because a symptom is what an operator
+  actually has: "the panel shows a frozen or corrupt picture" rather than
+  "hardware pixel DMA". Entries carry hidden search keywords, so searching
+  "frozen", "black", "stuck" or "garbage" all reach the DMA explanation.
+
+  The install's own numbers sit at the top, now including how many panels are
+  running an on-panel program.
+
+### Fixed
+- **The README said a streamed panel goes black when the host dies. It does
+  not.** Nothing in the firmware blanks a panel when the stream stops — no new
+  frames simply means the last complete frame stays lit. That is materially
+  worse than going black: a dead host looks exactly like a working sign until
+  someone notices the clock has not moved, which is the argument for on-panel
+  programs and was being stated backwards.
+
+### Documentation
+- README gains the failure-mode reasoning behind the mode choice, the Help
+  page, and pointers to the colorlight repo's hardware and FPGA guides.
+
+## [0.6.0] - 2026-09-15
+
+### Added
+- **Panel modes.** `panels.mode` (`stream` | `program`) and `panels.program`
+  (Alembic `4ff74165bd25`). A panel is either streamed to or runs an on-panel
+  program; never both, because each writes the framebuffer and the result is
+  corruption rather than one winning. Served to the panel in its TFTP config so
+  the choice survives a reboot.
+- **Value pusher** (`services/player/valuepush.py`) — pushes named values from
+  the existing panel-bus subscription to program-mode panels. A few hundred
+  bytes a second against the ~24 Mbit/s a streamed panel eats to show a static
+  clock face. It ASKS each panel what mode it is in rather than being told.
+- **Mode and program pickers** on the Panels page. The program list is fetched
+  from the panel (`GET /panels/{id}/programs`): one firmware carries every
+  program, so the list belongs to the build on that card and a copy here would
+  drift. The content dropdown is hidden in program mode, where a show means
+  nothing.
+- The player re-asserts the panel's pixel DMA every tick.
+
+### Fixed
+- **The panel card showed the wrong field and explained too much.** Mode is a
+  two-way switch, so it reads `Network` or `Program` and nothing else, and
+  exactly one follow-up field follows from it — `content` for a Network panel,
+  `program` for a Program one. A show means nothing to a panel drawing its own
+  pixels and a program means nothing to one being streamed to; offering both is
+  what made the card confusing. Stored values stay `stream`/`program`.
+- **`PATCH /panels/{id}` could not patch.** It validated against `PanelIn`,
+  where `name` and `host` are required, so a partial body was rejected with 422
+  — while the handler already used `exclude_unset`, i.e. it had always been
+  written for partial updates. Changing one field meant resending every other.
+- **A panel reboots with pixel DMA OFF**, and marquee only enabled it when the
+  player started. Any reboot silently dropped that panel onto the ~600k px/s CPU
+  path, where the receive ISR cannot drain the MAC FIFO: ~3 chunks of every 12
+  are lost, so NO frame completes and the panel keeps showing whatever was on
+  it. That reads as a frozen or corrupt display rather than a slow one, and was
+  misdiagnosed twice before being found.
+
+## [0.5.0] - 2026-09-14
+
+### Added
+- **`graph` layer** — a sparkline of a Home Assistant entity's recent history,
+  backed by a new `ha_history_reader` (its own cache: history is a far heavier
+  query than a state read, and a 24-hour window does not change between frames).
+
+  Deliberately minimal — line, optional fill, optional baseline, no axes or
+  gridlines. On a 64px-tall panel that furniture would eat the signal, which is
+  the same lesson `HUB75.md` records about small text.
+
+  Non-numeric states are dropped rather than plotted as zero, since
+  `unavailable` graphed at zero draws a cliff that looks like data.
+  Downsampling picks one sample per column rather than averaging, because on a
+  sensor trace the spikes are usually the point.
+
+- **`house-status` show** — Dashboard outside temperature and condition on the
+  left panel, lights-on count and its 24-hour trace on the right. Sized
+  **256x64** for two 128x64 panels side by side.
+
+### Fixed
+- **`make be-test` never worked.** `pytest` was absent from the api image, and
+  `tests/` was empty — so the target errored, and would have run zero tests if
+  it hadn't. pytest is now in the image, the Dockerfile copies tests in, and
+  there are **17 tests** covering the wire protocol: chunk arithmetic, packet
+  shapes and MTU bounds, palette edge cases, quantiser behaviour, scene-field
+  validation.
+
+- **Alembic was claimed but absent.** `db.py`'s docstring already said "Real
+  schema CHANGES go through Alembic (homelab-app-standard §12)" and
+  `alembic==1.14.0` was in requirements, but nothing was wired — so
+  `Base.metadata.create_all()` was the only path, and it never ALTERs an
+  existing table. A column added to a model would silently never reach the live
+  database.
+
+  Now scaffolded: `alembic.ini`, `env.py` reading the URL from the environment
+  the way the services do (so a migration cannot be applied to a different
+  database than the app uses), an initial revision autogenerated against an
+  empty database capturing all 8 tables, and **the live database stamped** at
+  it so it will not try to recreate. `render_as_batch=True` because SQLite
+  cannot ALTER a column in place.
+
+  New targets: `make migrate`, `make db-revision M="..."`, `make db-current`.
+
+### Notes
+- Home Assistant needs `ha.base_url` (set) and `ha.token` (**not set** — long-
+  lived tokens can only be minted from HA's UI). Until the token is present
+  every `{ha:...}` renders the no-value glyph and graphs draw only their
+  baseline; nothing else is affected.
+
+## [0.4.0] - 2026-09-14
+
+### Added
+- **Indexed wire format: ~3x the frame rate on graphics content.** A new
+  `display.format: indexed` on a show quantises each frame to 256 colours and
+  sends one byte per pixel instead of three, with the palette pushed separately.
+
+  The win is packets, not bandwidth. The panel is bound by **per-interrupt
+  cost**, not pixels — its CPU is already out of the pixel path because the
+  gateware DMA consumes the UDP stream directly, and the panel repo measured
+  ~1.13 packets per ISR entry against a ~20.6 fps ceiling at 256x192. Putting
+  the same MTU to work on 3x the pixels takes a 256x192 frame from **101 chunks
+  to 34** (verified), so the interrupt bound moves by the same factor.
+
+  Deliberately a per-**scene** setting rather than per-panel, because it is a
+  property of the content: text, charts and flat graphics quantise with no
+  visible loss, photographs and video band. The same panel plays both.
+
+  Quantisation is median cut with dithering **off** — dither noise that vanishes
+  on a 200 dpi screen is individually visible lit pixels at this pitch, and it
+  crawls on moving content.
+
+  `PIXELS_PER_CHUNK_INDEXED` is 1461 (3 x 487), matching the panel and the
+  gateware. Not 1462: that is not divisible by three, and would place every
+  chunk after the first one pixel left of where the hardware writes it, showing
+  as shearing rather than as an error.
+
+- **Palette packets (`'B','P'`).** 256 entries in 768 bytes, one packet, with
+  partial updates legal. The player sends a palette only when it changes, which
+  on most content is one packet at scene start rather than one per frame.
+
+### Requires
+- Panel firmware speaking `'B','I'` / `'B','P'` (colorlight 2026-09-14 or
+  later). Older firmware counts these as bad magic and shows nothing, so
+  `format` defaults to `rgb` and existing shows are untouched.
+
+### Known gaps
+- `make be-test` cannot run: `pytest` is not installed in the api image. This
+  predates the change. The indexed path was verified functionally instead
+  (quantiser output sizes, packet magics, chunk counts, MTU bounds, payload
+  totals, and scene-field validation).
+- Nothing has been confirmed on a physical panel — the test board is powered
+  down.
+
+## [0.3.0] - 2026-09-10
+
+### Added
+- **Each panel card links to the board's own web interface.** Every Colorlight
+  card serves an HTTP status page from its firmware -- layout, DMA state, packet
+  and MAC counters, the crash breadcrumb -- and reaching it previously meant
+  knowing the address and typing it by hand. The link sits in the card footer,
+  opposite "last seen", opening in a new tab.
+
+  The URL is built as `http://<host>/` and deliberately does **not** use
+  `panel.port`. That field is 7000, the UDP pixel-stream port; the firmware's
+  HTTP server listens on the default port, so deriving the link from `port`
+  would have produced a dead link on every card in the fleet.
+
+## [0.2.0] - 2026-09-07
+
+### Added
+- **Live data over panel-bus, no polling.** Marquee holds one websocket to a
+  panel-bus, which already maintains a single upstream connection per feed and
+  replays the last snapshot on subscribe. Bindings read a memory cache:
+  `{bus:home.status|weather.temp}`.
+  Two reasons this beats Marquee integrating each service itself: one place
+  holds the credentials and the reconnect logic, and the render path never
+  touches the network -- a sign redrawing 20 times a second must read a value
+  from memory, not make a request.
+- **Home Assistant + HTTP bindings** — `{ha:sensor.x}` via the REST API, and
+  `{http:url|json.path}` for services with a plain HTTP API.
+  Both cached; both render the no-value glyph on failure rather than raising.
+- **Twelve demo shows** covering the real content shapes: a full-screen home
+  movie, picture-in-picture with two decoders, a Times Square video-plus-crawl,
+  a station clock, a quad camera wall, Wowza live, YouTube, HA sensors, HVAC
+  status, split video/data, a three-lane ticker wall, and a multi-scene
+  rotation.
+
+### Fixed
+- **Scrolling text juddered.** Three independent causes, all measured:
+  - The renderer animated on the wall clock, so each frame advanced the scroll
+    by however long the previous render happened to take. It now derives a frame
+    index from elapsed time and renders at exactly `index/fps`, which also skips
+    an index rather than letting the show drift behind real time.
+  - Scroll speed was fractional pixels per frame. PIL draws at integer
+    positions, so 40 px/s at 15 fps became a 3,3,2,3,2 stagger. Speed is now
+    snapped to whole pixels per frame -- under half a pixel of speed error,
+    perfectly even motion.
+  - The pacing deadline was built from frames *sent* while the index came from
+    elapsed time, so after any skipped frame the deadline was already in the
+    past and the loop spun instead of sleeping.
+- **Scrolling text restarted with a gap.** It now draws a second copy one period
+  to the right, so the tail of one pass is immediately followed by the head of
+  the next and the band never blanks.
+- **The frontend could not reach the API.** Its nginx served static files and
+  fell everything else through to the SPA catch-all, so `/api/v1/panels`
+  returned index.html -- the browser got HTML where it expected JSON and every
+  list rendered empty with no error. The container now proxies `/api`, `/auth`,
+  `/ws` and `/healthz`.
+- **The TFTP server truncated transfers.** The hand-rolled implementation
+  accepted only an ACK for the exact block just sent, so a duplicate or delayed
+  ACK -- routine in TFTP -- caused a retry storm and a partial image, and panels
+  would not boot ("no ack for block 3"). Replaced with tftpy, keeping dynamic
+  per-panel resolution. tftpy then `flock()`ed the object handed to it, which a
+  BytesIO cannot support, so payloads spool to a real temp file.
+- **A crashed TFTP thread took the boot service down silently.** Panels cannot
+  boot without it, so it is now supervised and restarts.
+- **A panel reboot silently stopped streaming.** The hardware pixel DMA resets
+  to off, and the packet spacing Marquee streams at is far above what the slow
+  CPU path absorbs, so every frame was dropped and the display went black. The
+  player now asserts the fast path when it connects.
+- **`{ha:...}` never resolved** — the stored callable shadowed the resolver
+  method of the same name, so the lookup found `None` and left the token
+  unrendered.
+
+### Changed
+- Stats polling is now disableable (`MARQUEE_POLL_INTERVAL_S=0`). Sampling costs
+  the *panel*: it serves `/api/status` from the same interrupt handler that
+  consumes the pixel stream, so each poll is a brief gap in frame processing.
+
+
+## [0.1.0] - 2026-09-07
+
+Initial scaffold.
+
+### Added
+- **Scene language** (`marquee_core.scene`) — declarative YAML: display, scenes,
+  layers (solid/gradient/image/video/text), boxes, fit modes, z-order,
+  durations, transitions. Validated with Pydantic; a layer placed entirely
+  outside the canvas is an error rather than a silently blank sign.
+- **Renderer** (`marquee_core.render`) — Pillow compositor, ffmpeg video decode,
+  scrolling text, `cover`/`contain`/`stretch` fitting. A failing layer is logged
+  and skipped rather than blanking the display.
+- **Bindings** (`marquee_core.bindings`) — `{clock}`, `{date}`, `{file}`,
+  `{http}`, `{ha}`, `{env}`. Every resolver is total: a failed lookup renders a
+  marker, never an exception.
+- **Sources** (`marquee_core.sources`) — local files, `plex:` libraries (the
+  existing `/share/homemovies` and `/share/movies` mounts), `youtube:` via
+  yt-dlp, `cam:` and `wowza:` live streams, and raw rtsp/rtmp/http. Live URLs
+  live in a registry, not in scene documents, so shows are safe to share.
+- **Panel protocol** (`marquee_core.stream`) — the UDP bitmap protocol with
+  deadline-based pacing.
+- **Fleet model** — panels, shows, assignments, dayparting schedules (including
+  windows that wrap midnight), API tokens, users, and a panel stats time series.
+- **Poller** — samples panel counters; a counter going backwards is recorded as
+  a reboot rather than smoothed into a bogus rate.
+- **Player** — one render/stream thread per panel, re-resolving the schedule
+  every tick so a daypart change takes effect without a restart.
+- **TFTP boot service** — serves each panel its firmware and layout on port 6969.
+- **API** — panels/shows/schedules/stats CRUD, show validation, and
+  `POST /api/v1/play` so other homelab apps can put content on a panel.
+
+### Added (same release, second pass)
+- **Web console** (Vite + React + Tailwind, `homelab-system-ui` Slate language):
+  left-sidebar Shell, top-right account/status/logout cluster, version bottom-left,
+  light+dark theming, colour-blind-safe status chips. Pages: Panels, Content,
+  Schedule, Settings, Help, Login. Path-agnostic via runtime mount detection, so
+  one build serves at a hostname root and under `/marquee/`.
+- **Content editor with live preview** — the preview posts to the SAME renderer
+  the player uses, so what an operator sees is literally what a panel receives.
+- **Auth** — AD login (`ad_auth.py` shipped verbatim from the design skill) with
+  the domain-admins-only policy for a system console, plus a local break-glass
+  `admin` that authenticates through the password path and therefore still works
+  when AD is unreachable. Remember-me included.
+- **Scoped API tokens** — hashed at rest, shown once, individually revocable,
+  with throttled last-used stamping.
+- **Websocket** for live updates; queries have `refetchInterval: false` rather
+  than polling.
+- **TFTP boot service wired into the player** — serves each panel its firmware
+  and its layout by identity; anything else is refused.
+- **host-nginx config + Homepage tile** for same-origin `/marquee/` serving.

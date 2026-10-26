@@ -1,0 +1,834 @@
+# Architecture
+
+Marquee renders shows and streams them to LED walls, and configures the boards
+that render themselves. It is a `/srv/docker` service on the homelab standard —
+see [README.md](README.md) to run it and [doc/scenes.md](doc/scenes.md) for the
+scene language, which is the app's contract with its users.
+
+**Two words, used precisely throughout.** A **wall** is what a viewer sees: one
+logical display with one picture on it. A **card** is one receiver board driving
+a rectangle of that wall. Section 2a says why they are not the same object.
+
+The card side of this system lives in the **colorlight** repo — gateware,
+firmware, and the on-board programs.
+
+---
+
+## 0. Marquee is the runtime
+
+**Once a colorlight card is programmed, marquee is all you need.** Nothing in
+the colorlight repo runs continuously — it is a build and flashing toolkit.
+Marquee serves the card its firmware and config at boot, then either streams it
+pixels or pushes it values, and records what it is doing.
+
+The division: **colorlight builds what is on the board, marquee runs it.**
+
+Netboot takes precedence over flash, so while marquee is reachable the image
+marquee serves is the one that runs. A flashed image is the fallback for when it
+is not — which is what makes a standalone card possible.
+
+## 1. Three containers, one package
+
+```
+                          ┌──────────────┐
+  browser ───────────────▶│   frontend   │  React + Vite, nginx, :8411
+                          └──────┬───────┘
+                                 │ REST + WS
+                          ┌──────▼───────┐
+                          │     api      │  FastAPI, :8410
+                          └──────┬───────┘
+                                 │
+                          ┌──────▼───────┐        SQLite
+                          │   marquee.db │◀──────────────┐
+                          └──────┬───────┘               │
+                                 │                       │
+                          ┌──────▼───────────────────────┴──┐
+                          │            player                │  host network
+                          │  supervisor · TFTP · valuepush   │
+                          └───┬───────────────┬──────────┬───┘
+                              │ UDP 7000      │ TFTP     │ HTTP
+                              ▼               ▼ 6969     ▼
+                        ┌───────────┐   ┌───────────┐  card /api/*
+                        │ cards in  │   │ cards     │
+                        │  STREAM   │   │ booting   │
+                        └───────────┘   └───────────┘
+```
+
+| Service | Port | Does |
+|---|---|---|
+| `api` | 8410 | REST, auth, the fleet, previews, websocket fanout |
+| `frontend` | 8411 | the operator UI (a static React build behind nginx) |
+| `player` | **host** | renders, streams, serves TFTP boot, pushes values |
+| `dnsmasq` | **host**, profile `panel-link` | DHCP for cards on a **dedicated panel link** — off unless you run that topology ([doc/dedicated-link.md](doc/dedicated-link.md)) |
+
+TFTP is not a container of its own: `services/tftp/tftpd.py` runs as a thread
+inside `player`, which is already on the host network for the reason below.
+
+**`packages/marquee_core/` is the single source of truth** for the scene model,
+the renderer, the wire protocol and the DB models. `services/*` import it. A
+model copied into a service is a bug waiting to happen — the protocol especially,
+because the card will not complain, it will just draw garbage.
+
+### Why `player` runs on the host network
+
+Two independent reasons, both hard requirements:
+
+- The pixel stream is **thousands of UDP packets a second** to cards on the
+  local segment -- 2,700/s for a two-module wall at 20 fps, **5,400/s** for a
+  four-module one. NAT in that path is a cost nothing else pays for.
+- **TFTP boot replies must come from the host address the card's BIOS was
+  pointed at.** A card asks a specific IP for `boot.bin`; a reply from a
+  container address is not accepted.
+
+---
+
+## 2. The data model
+
+| Table | Holds |
+|---|---|
+| `walls` | a logical display: name, pixel size — **what content is assigned to** |
+| `cards` | a receiver board: host, MAC, size, **position in its wall**, layout YAML, **mode**, program, pacing |
+| `shows` | a scene document (YAML text) |
+| `assignments` | the default show for a **wall** — one per wall |
+| `schedules` | day-part overrides: show, time window, days, priority — per **wall** |
+| `card_stats` | a time series sampled from each card's own counters |
+| `settings` | key/value: HA credentials, cameras, Wowza base |
+| `users`, `api_tokens` | operators and machine callers |
+
+Shows are **authored in files** under `custom/<site>/shows/` and imported into
+the `shows` table (`make shows-import`). The database is what the running system
+reads; the files are what gets reviewed, versioned and backed up. `import_dir`
+is idempotent and only writes rows whose content changed, so re-running it is
+how a file edit reaches a wall.
+
+Show selection is `resolve_show_for(wall, now)`: the highest-priority enabled
+schedule whose window contains `now`, else the assignment. **It is re-evaluated
+every tick**, so a day-part change or an override takes effect within one scene
+frame — nothing restarts.
+
+Schema changes go through **Alembic**, never hand-rolled ALTERs.
+
+---
+
+## 2a. Walls and cards — why they are two things
+
+Until v0.11.0 there was one object, `panels`, that was both the board and the
+display. That held for exactly as long as one board could drive a whole wall. It
+cannot, and the three reasons arrive together as soon as a wall gets large:
+
+| Limit | Value on current hardware |
+|---|---|
+| Output connectors per receiver | typically **8** — a nine-module wall needs two boards |
+| Framebuffer | **327,680 px** — about ten 256×128 modules, then there is nowhere to put the image |
+| Memory bandwidth | sets the refresh rate: **36.8 Hz** for nine modules on one card, **49.1 Hz** split across two |
+
+The third is the interesting one: splitting a wall does not merely make a bigger
+wall possible, it makes the wall **faster**, because each card only reads its own
+region out of memory. That is also why commercial LED systems scale by adding
+receivers rather than by building bigger ones.
+
+How far one card goes depends on its gateware as much as its silicon. The E320
+(LFE5U-25F) drives **four** P1.25 256x128 modules at **66.7 Hz** -- the same
+refresh as three -- but only after colorlight gateware 1.45 made the scan-out's
+memory reads fetch in blocks and gave each row two row periods to arrive; the
+same card first ran four outputs at ~44 Hz. The colorlight repo's
+`docs/E320-BRINGUP.md` §6b has that story.
+
+So:
+
+```
+        wall "lobby"  768 x 384                     one picture, one show
+   ┌──────────────────┬──────────────────┐
+   │   card A         │   card B         │          two boards
+   │   (0,0) 384x384  │   (384,0) 384x384│
+   └──────────────────┴──────────────────┘
+              │                  │
+              ▼                  ▼
+      crop (0,0,384,384)  crop (384,0,768,384)      one render, two crops
+```
+
+**The render happens once.** `WallPlayer` draws the whole canvas for a frame and
+sends each card `canvas.crop(card.box)`. That is cheaper than rendering per card,
+and it is the only way two boards stay in step — they are handed the same frame,
+from the same render, in the same pass. Rendering twice would put two independent
+frame clocks on one picture.
+
+**A card does not know it is part of a wall.** It receives a frame sized to its
+own region and displays it. Nothing in the firmware or the wire protocol changed
+to make this work, which is why it applies equally to the HUB75 boards running
+today and to newer S-PWM hardware.
+
+**What belongs where.** Content is a property of the wall — every board covering
+one picture must play the same show, and assigning per card would let them
+disagree. Health is a property of the card: on a two-card wall it is precisely
+the difference between the two stat series that says which board is struggling.
+Mode is per card too, so one board can run an on-board program while its
+neighbours stream.
+
+**Gaps and overlaps are reported, not rejected.** An operator mid-edit will
+briefly have both, so `GET /walls/{id}/layout` returns them as problems and the
+UI draws them. A silent gap is a black band nobody can explain; a silent overlap
+is two boards rendering the same pixels.
+
+### Inside one card: connectors, and when a card learns its shape
+
+A card's own rectangle is tiled by its **output connectors**, and that tiling
+is the card's `layout_yaml`: a `grid` and one `J<n>: col,row` line per
+connector. The module type (`panel_type`) supplies the module size, the RGB
+group arrangement and the driver chip, so the layout only places connectors.
+A four-output E320 driving four 256x128 modules stacked is:
+
+```yaml
+grid: 1x4          # card is 256x512
+J1: 0,0
+J2: 0,1
+J3: 0,2
+J4: 0,3
+```
+
+**The card reads this once, at boot**, as `<mac>.yml` over TFTP (§7). Nothing
+pushes a layout to a running card, so changing a card's size, grid or
+connector placement in marquee takes effect at the card's **next boot** --
+reboot it or power-cycle it. Until then the card keeps its old geometry while
+the player already sends frames of the new size, and the two disagree about
+what a frame is. Compare the card's own `display_width`/`display_height` in its
+`/api/status` with the record before suspecting anything else;
+`GET /cards/{id}/bootconfig` shows exactly what the card will be served.
+
+A connector listed in the grid with no module on it is harmless: the card
+drives it and nobody sees it. The bench ran a four-output layout on two
+modules for exactly that reason -- the full four-module frame streams, and
+moving the two cables between J1/J2 and J3/J4 shows either half.
+
+---
+
+## 3. Rendering
+
+`marquee_core/render.py` — **a Show plus a wall-clock time → one RGB frame.**
+
+Pillow composites; ffmpeg decodes video. Deliberately **no numpy**: at 256×128 a
+frame is 32k pixels and PIL's C paths are comfortably fast enough, and leaving
+numpy out keeps the image small.
+
+The renderer is a **pure function of `(show, t)`** apart from video decoders,
+which necessarily hold position. That is what makes the web UI's preview the
+*same code path* as the stream — so what an operator previews is what the card
+shows, rather than an approximation that drifts.
+
+### A frame is drawn at the WALL's size
+
+The player calls `render(t, (wall_w, wall_h))`, so the canvas is always the
+wall's size, whatever the show declares. Box edges then resolve against that
+canvas: an **int is pixels** and stays exactly where it is written; a **float
+or a percentage is a fraction** of the wall and scales with it. Nothing is
+stretched afterwards.
+
+So a show written in absolute pixels for a smaller wall paints its own area
+and leaves the rest **black**. This has looked like dead hardware twice: a
+256x128 show on the first two-module (256x256) wall left the second module
+dark, and a 256x256 show on the four-module (256x512) wall left J3/J4 dark
+while every card counter was clean. Proving it took a framebuffer read-back:
+the lower half of the card's memory was all zeros. A taller wall needs a show
+authored for it (or fractional boxes) -- [doc/scenes.md](doc/scenes.md)
+"One show, many walls" has the table.
+
+> **The preview renders at the wall's size when it knows the wall** (0.43.0).
+> `POST /preview.png` takes optional `width`/`height`; the editor sends the
+> size of the first wall the show is live on, labels the preview "as on
+> <wall> (WxH)", and warns when the show's declared size differs. Without a
+> size it renders at the show's declared `display` size (256x128 when it
+> declares none) -- which, for a show sized differently from its wall, shows
+> the whole show while the wall shows it in one corner of a bigger black
+> canvas. Before 0.43.0 the editor always did that, and a 256x256 show
+> previewed complete while a 256x512 wall had two black modules.
+
+Layer types, bindings and sources are documented in
+[doc/scenes.md](doc/scenes.md). The scene language is a **breaking-change
+surface**: read that before touching it.
+
+**The `rows` layer is the one place the renderer loops.** A scene is a flat
+stack of layers by design — no expressions, no iteration — but a table is data
+whose *length* is not known when the show is written, and spelling one out as
+N×M text layers bakes the N in and draws every slot whether or not data reached
+it. `rows` takes a list from the live cache and draws one row per entry, capped
+by what fits in its box. Its cells are rendered by `_text` on a synthetic layer
+rather than by drawing there: alignment and the continuous-scroll machinery are
+subtle enough that a second copy would drift, and on a departures board a
+scrolling cell sits directly beside a scrolling text layer.
+
+### Layers composite with alpha; a scrolling string is rendered once
+
+Two properties of the compositor are load-bearing and were both wrong until
+2026-10-21.
+
+**`text`, `rows` and `plot` tiles are RGBA with a transparent background.**
+Every layer used to return an opaque RGB tile which the compositor pasted
+wholesale, so a text layer painted a **black rectangle** over whatever was
+beneath it -- meaning no show could put text over a gradient, an image or
+video and have the backdrop show through. `solid`, `gradient`, `image` and
+`video` still overwrite their boxes; only tiles that carry an alpha channel
+are masked. Layer `opacity` below 1 scales the tile's own alpha, so a
+half-opacity caption fades its glyphs rather than fading a black rectangle
+over the picture.
+
+**A scrolling string is rasterised ONCE into a cached strip** and the visible
+window is blitted out of it (`_ScrollStrip`). A crawl is far wider than its
+window by definition -- a live banner is 1993 px of text in a 248 px box -- so
+drawing the whole string every frame discarded nearly all of that work:
+measured 2.756 ms a frame against 0.008 ms for the blit, **347x**.
+
+The obvious alternative, drawing only the visible *substring*, is **wrong**.
+The substring has to be placed at a fractional x, and PIL anti-aliases a
+fractional position differently from the integer one a full draw uses, so
+every glyph edge shifts -- 25 of 1028 scroll positions differed. A strip is
+exact by construction: the pixels *are* the full draw's pixels. Any change
+here must be verified pixel-identical at **every** position of a full wrap,
+not sampled.
+
+Render cost is also a *transmission* concern, not only a frame-rate one --
+see [Pacing is the whole game](#pacing-is-the-whole-game) for why compose time
+turns into lost pixel chunks.
+
+### Live bindings never block the render thread
+
+`{http:...}` and `{ha:...}` resolve from a cache and refresh on a **background
+pool**, with in-flight dedupe and a give-up window after which the field shows
+the house no-value glyph. They used to fetch synchronously inside compose, with
+a 3 s timeout: a single text layer was measured at **609 ms of a 50 ms frame
+budget**, and the sender went 29 s without completing a frame.
+
+`{bus:...}` and `{data:...}` have always been pure memory reads, and their
+docstring states the rule the other two broke: **rendering never makes a
+network call.** Keep it that way.
+
+---
+
+## 4. The wire protocol
+
+`marquee_core/stream.py`. **Fixed by the firmware** — it must match
+`sw_rust/barsign_disp/src/bitmap_udp.rs` in the colorlight repo. Changing one
+without the other silently corrupts frames.
+
+One UDP datagram per **chunk**, to port 7000. Little-endian header, then
+pixels. Two header shapes:
+
+```
+narrow, 10 bytes  <2sHBBHH>            wide, 12 bytes  <2sHHHHH>   (magic BW)
+0..1  magic                            0..1  magic 'B','W'
+2..3  frame_id u16                     2..3  frame_id u16
+4     chunk_index u8                   4..5  chunk_index u16
+5     total_chunks u8                  6..7  total_chunks u16
+6..7  width u16                        8..9  width u16
+8..9  height u16                       10..11 height u16
+```
+
+Chunk N carries the pixels starting at **N x pixels-per-chunk**; the card
+writes it there, so the stride is part of the protocol, not a tuning value.
+`width`/`height` are the CARD's frame size (its crop of the wall), and the
+card checks them against its own geometry.
+
+| Magic | Format | Pixels/chunk |
+|---|---|---|
+| `BM` | RGB888, 3 B/px | 487 |
+| `BI` | **indexed**, 1 B/px | **1461** |
+| `BP` | palette — 256 entries in 768 bytes, one packet | — |
+| `BW` | RGB888 over 255 chunks — u16 `chunk_index`/`total` in a **12-byte** header | **486** |
+
+> **Every packet must fit a 1500-byte MTU**: 1472 bytes of UDP payload. `BM` is
+> 10 + 1461 = 1471. `BW` was once 12 + 1461 = 1473: the kernel split every chunk
+> into two IP fragments, the card parses only the first, and the last pixel of
+> each chunk never landed — a fixed diagonal lattice of stale pixels with every
+> card counter at zero. So a wide chunk is one pixel shorter (12 + 1458 = 1470),
+> matching colorlight gateware 1.46.0 / firmware 3.9.0. `stream.py` asserts the
+> budget at import and `tests/test_wire.py` checks the packets.
+
+**When the wide header is used.** `_send_chunked` counts chunks at the narrow
+stride; over 255 it switches to `BW` and re-chunks at 486. Only RGB has a wide
+form -- an indexed or palette frame that large raises rather than sending
+something the card would misplace. A frame of 255 chunks or fewer is
+byte-for-byte what it always was, so older cards are unaffected.
+
+| card frame | pixels | chunks | header | packets/s at 20 fps |
+|---|---|---|---|---|
+| one 256x128 module | 32,768 | 68 | narrow | 1,360 |
+| two modules, 256x256 | 65,536 | 135 | narrow | 2,700 |
+| three, 256x384 | 98,304 | 202 | narrow | 4,040 |
+| four, 256x512 | 131,072 | **270** | **wide** | **5,400** |
+
+**The ceiling on one card is 512 chunks**, not the framebuffer. The card
+tracks arrival with a 512-bit mask (firmware `MAX_CHUNKS`, the gateware's
+`arrival` register). The firmware refuses a frame claiming more; the gateware's
+mask is indexed by the low nine bits, so chunk 512 would alias onto chunk 0 --
+never send one. The largest RGB frame one card takes is therefore 512 x 486 =
+248,832 px, about 7.6 P1.25 modules, under the 327,680 px a framebuffer holds.
+Past that a wall is split across cards, which §2a recommends anyway for
+refresh rate.
+
+**What the card does with a frame** (colorlight, summarised; its
+`docs/E320-BRINGUP.md` has the detail). The gateware's pixel DMA takes chunks
+straight off the wire into the back buffer -- the card's CPU never touches
+pixels -- and records each chunk in the arrival mask, so a duplicate is
+harmless. The buffers swap at a frame boundary, and **only when every chunk of
+the outgoing frame arrived**: a frame with a hole is held off the glass and
+counted in `frames_held`, so a lost packet costs a 50 ms repeat rather than a
+band of stale pixels. That gate, and the MTU fix above, are why "every counter
+clean" now means the picture is right -- except for the failure the fragment
+bug was, which no card counter could see.
+
+**Indexed is the fast path**, and the reason is not bandwidth. The card's bound
+is **per-interrupt cost**: its CPU is already out of the pixel loop, and the
+panel repo measured ~1.13 packets per ISR entry. One byte per pixel puts the
+*same MTU* to work on three times the pixels, so the same frame is ~3× fewer
+chunks and the interrupt bound moves by the same factor. Measured end to end:
+**36.2 → 102.6 fps**.
+
+> **1461 is `3 × 487`, and it is not negotiable.** It matches the card's
+> `PIXELS_PER_CHUNK_INDEXED` and the gateware's chunk stride. Not 1462 — that is
+> not divisible by three, and using it would place every chunk after the first
+> **one pixel left** of where the hardware writes it. That shows up as *shearing*,
+> not as an error.
+
+Quantisation for indexed is **median cut with dithering off**. Dither noise that
+vanishes on a 200 dpi screen is individually visible lit pixels at this pitch,
+and it crawls on moving content. Choose the format **per show, by content** —
+text and graphics quantise invisibly; photographs band.
+
+### Pacing is the whole game
+
+A bare `time.sleep()` per packet drifts badly: the OS rounds every sleep **up**,
+so a requested 0.3 ms delivers more and the error compounds across the frame.
+`CardStream` sleeps against an **absolute deadline** and busy-waits the last
+stretch.
+
+`packet_delay` is **per card**, not a constant, because the card's ceiling
+depends on which pixel path it is running (~1250 pkt/s on the CPU path, far more
+on the gateware DMA) and because the frame size sets how many packets must fit
+one frame period. The working rule is `chunks x packet_delay ~= 80% of the
+frame period`:
+
+| card frame | chunks | `packet_delay` | one frame takes | at 20 fps (50 ms) |
+|---|---|---|---|---|
+| 256x256 | 135 | 0.0003 | 40.5 ms | fits |
+| 256x512 | 270 | **0.00015** | 40.5 ms | fits |
+| 256x512 | 270 | 0.0003 | 81 ms | **~12 fps** -- too slow |
+
+How the loop spends it: packets go out in **pairs** (`SEND_BATCH = 2`), one
+paced wait per pair of `2 x packet_delay`, so the average gap is
+`packet_delay`. After a stall the deadline is clamped forward rather than
+repaid as a burst, and the catch-up gap is floored at `MIN_SEND_GAP` (200 us)
+-- the floor applies only when the sender is behind, never to normal spacing,
+which is how 150 us pacing coexists with a 200 us floor.
+
+**A fragmented packet costs frame rate as well as pixels.** While the wide
+header overran the MTU (above), every chunk left the host as two datagrams,
+doubling the kernel's per-packet work: the four-module wall ran at 15-17 fps
+on 0.00015 pacing and went to 20.0 the moment chunks fit. A frame rate that
+falls short on a large frame is worth checking against
+`/proc/net/snmp` `Ip: FragOKs` on the sender, which should not move at all.
+
+**`MARQUEE_REDUNDANT_COPIES`** (default **1**) sends each frame N times under
+one frame id; the card deduplicates chunks, so a frame completes if either copy
+of every chunk arrives. It was the answer to packet trains on a shared switch
+(0.41.0) and is off because the dedicated link removed the trains -- and
+because it multiplies the packets per frame, which a four-module frame has no
+room for. If you turn it on, divide `packet_delay` by N.
+
+#### What the pacing does NOT control
+
+**`SO_SNDBUF` is 1 MB, so `sendto()` returns immediately.** The pacing
+controls when packets are handed to the **kernel**, not when the NIC transmits
+them. A sender thread that is descheduled -- even briefly -- lets the kernel
+drain its queue at **line rate**, and that burst is what overflows a receiving
+card's input FIFO and costs whole pixel chunks. `packet_delay` is irrelevant
+to it.
+
+This matters more than it sounds, because the two Python threads that matter
+**share the GIL**. Every millisecond the render thread holds it is a
+millisecond the pacing loop cannot run. Measured 2026-10-21 on two 256x128
+modules, same card, same wire:
+
+| show | compose | chunks lost |
+|---|---|---|
+| rail board (text only) | 2.2 ms | **0.000/s**, zero in 1.13 M |
+| movie + ticker (video) | 8-10 ms | 12.96/s |
+
+So **render cost is a transmission concern**, not just a frame-rate one. A
+binding that blocked compose for 610 ms (a synchronous HTTP fetch inside the
+render path, since fixed) starved the sender for 29 s.
+
+#### The per-packet cost is sleep overshoot, not Python
+
+Measured on the host, per packet: slicing the chunk body 0.32 us, packing the
+header 0.13, the concat 0.41, `sendto` 4.92 -- about **5.9 us of work**. A
+`time.sleep(200us)` overshoots by a median of **53 us** and up to 75.
+
+At one sleep per packet that added ~10.5 ms to a 40.5 ms frame, so 135 chunks
+took 51 ms against a 50 ms budget. The result was a **deficit, not a stall**:
+delivery stayed perfectly even (65 wire-measured intervals, none over 70 ms)
+at 19.58 fps against 20.0 rendered -- one frame short every 2.4 s. Because the
+renderer snaps motion to whole pixels per frame, each missing frame is a
+double step, which on the glass is a visible hitch every couple of seconds.
+
+`SEND_BATCH` paces every *second* packet, halving the sleeps and the
+overshoot. After: median 50.0 ms, p99 50.6, **20.00 fps**.
+
+**A Rust or C sender would not help this.** It removes the 5.9 us and inherits
+the 53 us, because `nanosleep` overshoots the same in any language. The real
+escape is **kernel pacing** -- `SO_MAX_PACING_RATE` with an `fq` qdisc, or
+`SO_TXTIME` with ETF hardware offload on an Intel i225/i226 NIC. Note that
+`SO_MAX_PACING_RATE` is silently accepted and does nothing under `fq_codel`,
+so check the qdisc before believing pacing is in effect.
+
+At 5.9 us a packet, even a nine-module wall (12,120 packets/s) is about 7% of
+one core. Packet rate has never been the limit.
+
+---
+
+## 5. The player supervisor
+
+**One thread per wall**, not per card. Rendering is CPU-bound in PIL/ffmpeg and
+streaming is paced, so walls must not block each other.
+
+Each tick, per wall:
+
+1. resolve the show for now
+2. render the **whole canvas** at the wall's size — once, however many cards
+   cover it
+3. for each streaming card: `canvas.crop(card.box)`
+4. convert (`frame_to_rgb` or `frame_to_indexed`) and queue it
+5. a **separate sender thread** transmits the queued frame to each card, paced
+   per card
+6. the `Supervisor` samples each card's counters into `card_stats`
+
+**Render and send are two threads with a bounded queue between them.** They
+used to be one loop -- compose, transmit, sleep -- so one slow compose made the
+transmit late too, and the card discards a late frame: 0.24 dropped frames/s
+on video against 0.02/s on content that cost nothing to render, twelvefold,
+entirely from that coupling. The renderer now runs a few frames ahead and the
+sender keeps a strict schedule (no two frames closer than 0.9 of a frame
+period). Both release the GIL in PIL and in `sendto`, so both progress.
+
+Step 3 is where a multi-card wall stays coherent. Steps 2 and 4 being on
+opposite sides of the crop is also why an *indexed* wall quantises per card:
+two crops of one canvas do not generally produce the same 256-colour palette,
+so each card gets its own.
+
+The set of cards is reconciled against the database every tick, so a card added
+to, moved within, or removed from a wall takes effect without a restart.
+
+**The show is reconciled by CONTENT, not just by id.** The reload test used to
+be `want != current_show_id`, so the body was re-read from the database every
+tick and then discarded -- an edited show changed nothing on the wall until
+something else forced a reload, by switching shows or restarting the player.
+Anyone editing a show in the UI hit this every time: the edit saves, the wall
+does not change, and there is no error to go on. It is now keyed on a hash of
+the body as well, and logs `show N edited -- reloading`.
+
+If you add any other per-show state, reconcile it the same way. The failure
+mode is silent agreement between two places that disagree -- the database held
+`fps: 22.22` while the player sent exactly 20.00 and nothing reported it.
+
+### Re-asserting the DMA is not optional
+
+A card **boots with its pixel DMA off**. Enabling it once at player startup is
+therefore not enough — any reboot (power cycle, firmware reload, watchdog)
+silently drops that card onto the CPU pixel path, where the receive ISR cannot
+drain the MAC FIFO.
+
+> The visible result is not "slow". Roughly **3 chunks of every 12 are lost, so
+> no frame ever completes**, and the card keeps showing whatever was on it
+> before. That looks like a frozen or corrupt display, not a performance
+> problem. It cost most of an evening to find — twice.
+
+So `_dma_is_off()` is checked and re-asserted **every supervisor tick**, not
+once at startup.
+
+### Holding the stream while a card boots
+
+A rebooting card spends its first seconds in the **BIOS**, netbooting its
+firmware over TFTP -- and the BIOS has no hardware pixel path. Every streamed
+packet lands in one of its two CPU receive slots, which a stack busy with TFTP
+has to poll out. Measured on the dedicated link with nothing else on the wire:
+with the stream running, the firmware transfer crawled at 45 kbps, needed seven
+retransmissions and the BIOS gave up at block 228, **so the card never came
+back**; with the stream held, the same transfer took under a second.
+
+So the `Supervisor` probes each streaming card's `/api/status` every
+`LIVENESS_S` (5 s). **Two consecutive misses** put the card in `DOWN_HOSTS` and
+the sender drops its payloads; the first answer takes it out again and DMA is
+re-asserted. One miss is not enough: the card's HTTP shares the interrupt
+handler with the pixel path, so a single slow reply under load is normal, and
+holding on that blacked out the wall for a whole poll interval on the first
+deploy. The hold lands within ~10 s of a card going away, well inside the
+~35 s its BIOS keeps retrying.
+
+### One writer per card
+
+A card's framebuffer has exactly one writer. A `stream` card that is still
+**running an on-board program** -- left on by hand, or applied from a boot
+config -- would be streamed into while it composes its own pixels; the
+firmware resolves that by holding the stream, so the glass shows the program
+while marquee reports "streaming". Each full tick asks every stream-mode card
+whether a program is running and stops it if so. The opposite case, a
+`program` card whose program is not running, is restarted the same way (§6).
+
+The same rule applies across hosts: **never run a second player (or any other
+sender) against a card**. Two senders produce interleaved frame ids, and the
+symptom is a picture that looks like a font or mapping fault rather than a
+conflict.
+
+---
+
+## 6. Card modes — and why the player skips half the fleet
+
+A card is in exactly one mode, and the DB is the source of truth:
+
+| `cards.mode` | Card does | Marquee sends |
+|---|---|---|
+| `stream` | displays frames it receives | **pixels**, ~24 Mbit/s |
+| `program` | **runs its own program**, composing pixels from values | **values**, ~20 bytes/s |
+
+The supervisor **skips program-mode cards entirely** — no render, no stream. On
+a multi-card wall this is per card: one board can run a program while its
+neighbours stream.
+`ValuePusher` serves them instead, pushing bus values to `POST /api/values` on
+each one every 10 s.
+
+`ValuePusher` starts unconditionally and **asks each card what mode it is in**,
+skipping the ones that are streaming. That is deliberate: no second setting to
+drift out of sync with the DB.
+
+**WHICH program a card runs comes from the database, not from the card.**
+`/api/display` reports `program (on-panel)` without naming it, and marquee is
+what serves the name over TFTP in the first place. That matters because values
+are **selected by program, never merged**: the on-card table holds 24 keys and
+`set()` ignores the 25th rather than evicting, so accumulating every source's
+values would silently drop whichever key went last. A provider declares the
+programs it can feed (`PROGRAMS`) and returns `board_pages()`; anything else
+gets the panel-bus mapping as before.
+
+The **rotation is host-side** for the same reason the page is a value at all:
+rows outside a program's `dynamic` band repaint only when a value arrives, so a
+card cycling on its own frame counter would redraw the whole canvas every frame.
+Measured on the bench card: a four-row board with a scrolling column runs at
+**7.9 fps**, against **30.3** — the frame-period cap — with nothing moving.
+
+Two writers on one framebuffer has no good failure mode — it looks like
+corruption rather than like a conflict — so the modes are kept mutually
+exclusive at every layer.
+
+---
+
+## 7. TFTP boot
+
+`services/tftp/tftpd.py`, on port **6969** — *not* 69. The gateware sets
+`TFTP_SERVER_PORT=6969`.
+
+`tftp_resolve(filename, client_ip)` serves cards **by identity**. Anything
+unrecognised is refused: this exists to boot cards, not to serve files.
+
+| Request | Answer |
+|---|---|
+| `boot.bin` | the firmware named on that card's row, else the default |
+| `<mac>.yml` | that card's `layout_yaml`, **plus** the module type's geometry/arrangement/chip (`PANEL_TYPES`), **plus its mode, program and drive** |
+
+The mode is **appended at serve time** rather than stored in the layout text:
+
+```python
+cfg += f"mode: {p.mode or 'stream'}\n"
+if p.program:
+    cfg += f"program: {p.program}\n"
+```
+
+One source of truth, and an operator editing the layout YAML cannot accidentally
+strand a card in program mode.
+
+The server thread **restarts itself on failure**. Cards cannot boot without it,
+so a crashed thread must not silently leave the fleet unbootable.
+
+> **tftpy is given an EMPTY root, deliberately.** Its RRQ handler serves a
+> static file if one exists and only calls `dyn_file_func` when it does not. With
+> the firmware directory as the root, `boot.bin` was served straight off disk and
+> **`tftp_resolve` was never called for it** — so the `firmware` field on a card
+> record did nothing. `<mac>.yml` worked only because no such file exists on
+> disk. Do not "tidy" that back to passing the real root.
+
+> **Per-card firmware works on colorlight v2.3.0 or later, and not before it.**
+>
+> That BIOS derives its MAC from the card's flash unique ID and does its own
+> DHCP, so `boot.bin` is requested from the card's own (reserved) address and
+> `tftp_resolve`'s lookup by host succeeds. Measured on the bench card: the
+> request moved from `192.168.1.50` to `192.168.1.70`, and the log line went from
+> `identified as bench … via ARP` to a direct hit. Staged rollout over TFTP is
+> real on those cards.
+>
+> On **earlier** bitstreams it is not, for a reason outside marquee: that BIOS
+> fetches `boot.bin` *before DHCP*, using the gateware's own IP and MAC — both
+> compile-time constants shared by every card built from that bitstream, so
+> every card asks from the same address. The resolver says so loudly
+> (`not identified (arp=…); serving default`) rather than silently serving the
+> default, and the ARP fallback in `_mac_for_ip()` exists for exactly them.
+> For those cards staged rollout is still a **flashing** operation.
+
+Because the layout arrives only here, **a change to a card's geometry takes
+effect at its next boot** (§2a).
+
+### The panel link
+
+The recommended topology puts cards on a **dedicated link**: the sender's
+second NIC, a small switch carrying nothing else (or a direct cable), its own
+unrouted /24, and the `dnsmasq` service handing the card its address and the
+boot server as DHCP option 66. It exists because a shared, busy uplink queues
+the stream behind other hosts' bursts and delivers it as trains of 40-60
+packets, which overflow the card's input FIFO; removing the shared path removes
+the trains at the source. [doc/dedicated-link.md](doc/dedicated-link.md) is the
+runbook, including the two traps met bringing it up (a stream drowning the
+BIOS netboot, and never forcing the NIC's speed).
+
+### Boot precedence
+
+A card's firmware may carry a config baked in at build time. The order is:
+
+1. the TFTP config marquee serves — **always wins when it answers**
+2. the card's compiled-in default, applied before its network is even up
+3. a single card at the bitstream's geometry, expecting a stream
+
+So a standalone panel is not a special case that escapes management: point it at
+marquee and marquee takes over. The baked config only covers the gap before
+marquee answers, and the case where it never does.
+
+---
+
+## 8. Live data — one cache, two kinds of writer
+
+`LiveState` in `marquee_core/live.py` is the whole live-data plane: the last
+payload per **topic**, in memory. Bindings read it — `{data:mnr.harlem|...}` —
+and the render path therefore makes no network call.
+
+Two things write into it, and **nothing downstream can tell them apart**:
+
+| writer | is | configured by |
+|---|---|---|
+| `BusClient` | a websocket to a **panel-bus** that fans out feeds | `MARQUEE_BUS_URL` |
+| `ProviderHost` | **data providers** — plug-in Python, one thread each | files in a directory |
+
+That indistinguishability is the point. A provider did not need a new binding, a
+new layer type or a preview path: it publishes a topic, and `{data:...}`,
+`sparkline` and `ValuePusher` already read topics. The cost of adding the
+plug-in plane was a writer, not a stack.
+
+> **`{bus:...}` and `{data:...}` are the same read.** `bus` is the older
+> spelling, from when the panel-bus was the only writer. Naming a binding after
+> a transport was wrong once there were two, but shows in the field use it, so
+> both resolve identically and neither is going away.
+
+`LiveState.put` records which writer owns each topic. Two writers on one topic
+is a misconfiguration whose symptom is a value *flickering between two
+plausible readings* — close to undiagnosable from the sign — so it is a log
+line and an API field instead.
+
+### 8a. Data providers
+
+`marquee_core/providers.py`. A provider declares a `name`, an `interval_s` and
+a `poll()` returning `{topic: payload}`; `ProviderHost` discovers, configures
+and runs it. `doc/providers.md` is the user-facing contract.
+
+Loaded from directories, later winning: `custom/example/providers` (shipped
+samples), `custom/<site>/providers` (yours, version-controlled beside your
+shows), `/data/providers` (drop-in, no rebuild). This is the `custom/`
+extension point the public-release plan names, used for the second time — and
+the shipped providers are the maintainers using it themselves, which is the
+only way an extension point stays honest.
+
+A file named `_*.py` is skipped by discovery, and the plugin's own directory is
+on `sys.path` while it imports, so providers can share a helper module rather
+than copying it. `sys.path` is **appended** to: a plugin directory holding
+`json.py` must not become the `json` module for the player.
+
+**Config is settings-only** (`provider.<name>.config`, JSON), merged over the
+class's `DEFAULTS`. A file beside the plugin was the obvious alternative and is
+the trap §6 warns about: a second place the same setting can live, and drift.
+
+**Failure is contained at every level**, because the rule is the one bindings
+follow — a missing integration must never blank a sign:
+
+- a file that will not import is skipped, loudly; the others still load;
+- `poll()` raising is caught, counted, and **the last good payload stays**;
+- repeated failure backs off geometrically to a five-minute ceiling.
+
+> A provider is **trusted code** running in the player process. There is no
+> sandbox and the plane does not pretend to offer one.
+
+**Both the player and the api run a host.** The api's exists so a *preview*
+renders from the same cache a wall does — the preview being the same code path
+is what makes it trustworthy, and that is only true if `{data:...}` resolves on
+both sides. The cost is two clients on each upstream.
+
+### 8b. The panel-bus
+
+A panel-bus holds ONE upstream connection per feed and fans it out over a
+websocket, publishing topics such as `home.status`. Unset, that half of the
+plane is off and the rest of the system is unaffected.
+
+Two reasons this beats Marquee talking to each upstream itself:
+
+- **One integration**, one set of credentials, one place to fix a broken feed.
+- **The render path never touches the network.** A sign redrawing 20 times a
+  second must read a value from memory, not make a request.
+
+The bus replays the last snapshot the moment a client subscribes, so a freshly
+started player is current immediately rather than blank until the next event.
+
+Home Assistant is separate: `ha.base_url` + `ha.token` in settings, with
+`ha_reader` (5 s cache) and `ha_history_reader` (its own, much longer cache — a
+history query is far heavier and stays useful far longer).
+
+> **A missing integration must never blank a sign.** With no HA configured,
+> `{ha:...}` renders the no-value glyph and graphs draw just their baseline. The
+> rest of the scene is unaffected.
+
+---
+
+## 9. Key files
+
+| Path | Purpose |
+|---|---|
+| `packages/marquee_core/scene.py` | the scene model — parses and validates shows |
+| `packages/marquee_core/render.py` | the compositor: `(show, t) → frame` |
+| **`packages/marquee_core/stream.py`** | **the wire protocol — must match the firmware** |
+| `packages/marquee_core/models.py` | SQLAlchemy models (**`Wall`, `Card`**), `resolve_show_for` |
+| `packages/marquee_core/bindings.py` | `{clock:}`, `{ha:}`, `{bus:}`, `{file:}` … |
+| `packages/marquee_core/live.py` | the topic cache, and the panel-bus subscriber |
+| **`packages/marquee_core/providers.py`** | **the data-provider plug-in plane** |
+| `packages/marquee_core/sources.py` | media resolution: plex, youtube, cam, wowza |
+| `packages/marquee_core/poller.py` | samples a card's counters |
+| `services/player/main.py` | entrypoint: bus, TFTP, value push, supervisor |
+| `services/player/player.py` | the per-**wall** render + sender threads, per-card crop, DMA re-assert, stream hold (`DOWN_HOSTS`), one-writer reconciliation |
+| `services/player/valuepush.py` | values → program-mode cards |
+| `services/tftp/tftpd.py` | boot server, port 6969 |
+| `services/api/app/routers/fleet.py` | walls, cards, shows, schedules, programs |
+| `services/api/alembic/` | migrations — **one head** |
+| `services/api/app/routers/providers.py` | the provider catalogue and topic inspector |
+| `custom/example/providers/` | three worked providers over two upstreams |
+| `doc/scenes.md` | the scene language (user-facing contract) |
+| `doc/providers.md` | how to write a data provider (user-facing contract) |
+
+---
+
+## 10. Working here
+
+- **Read [doc/scenes.md](doc/scenes.md) first** if you are touching rendering.
+  The scene language is the app's contract with its users; changes to it break
+  people's shows.
+- **Never copy a model out of `marquee_core`.** Import it.
+- **`stream.py` and the firmware's `bitmap_udp.rs` are one protocol in two
+  repos** -- three copies, counting the gateware's `dma_writer.py` chunk
+  stride. Change them together or not at all; `tests/test_wire.py` checks the
+  constants across all three when the firmware tree is present (`make be-test`
+  mounts it) and that every packet of a large frame fits the MTU.
+- **A new header field or magic: do the byte arithmetic first.** Header +
+  payload + 28 must stay <= 1500. Nothing on the card can tell you it did not.
+- **TFTP is 6969, not 69.**
+- Build with `make up-build`, never raw docker — images bake source at build
+  time, so `docker restart` runs old code.
+- Never `git add -A` blindly; check `git status` first.

@@ -1,0 +1,16 @@
+# A panel layout, in the same format the panel fetches over TFTP at boot.
+#
+# Bake it into the firmware so the panel needs no network at all:
+#   ./build.sh --default-config custom/example/configs/panel.yml firmware
+#
+# A config served over TFTP still overrides this when one arrives, so baking a
+# default never stops you managing the panel remotely.
+
+# One 128x64 panel on connector J1.
+grid: 1x1
+panel_width: 128
+panel_height: 64
+J1: 0,0 0,0
+
+mode: program
+program: hello

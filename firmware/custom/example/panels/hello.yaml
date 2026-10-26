@@ -1,0 +1,80 @@
+# The worked example for `custom/` -- copy this directory and start editing.
+#
+# A program composes its own pixels on the panel. It receives named VALUES
+# pushed by the server and draws from them, so it keeps running when the server
+# does not -- and can say the data is stale rather than freezing on a frame that
+# still looks correct.
+#
+# Build it:   ./build.sh panelc && ./build.sh firmware
+# Select it:  curl -X POST http://<panel>/api/program/on -d '{"name":"hello"}'
+#
+# THE ONE RULE: O(1) PER PIXEL.
+#
+# The panel is a 40 MHz VexRiscv with no D-cache, so a memory read costs about
+# what a write does, and 16384 pixels a frame means anything per-pixel is
+# multiplied by 16384. (It does have the M extension, so multiply and divide are
+# instructions -- but a divide is iterative, and a shift is not.) Two habits
+# follow, and both are visible below:
+#
+#   1. Put work in `row:`, which runs once per row, not once per pixel.
+#   2. Reject cheaply before computing anything expensive.
+program: hello
+display: {width: 128, height: 128}
+
+assets:
+  fonts:
+    - {name: big,   file: assets/fonts/DejaVuSans.ttf, size: 30}
+    - {name: small, file: assets/fonts/DejaVuSans.ttf, size: 13}
+
+# Values this program binds to. The server pushes them; until one arrives it
+# reads as "-", so a program never has to decide what absent looks like.
+values: [hhmm, temp]
+
+# Colour lives in the PALETTE, not the pixels. A program returns palette
+# INDICES, and a 4-bit glyph coverage is the offset into a 16-entry ramp -- so
+# anti-aliased text costs one add, and recolouring the whole sign costs 16 words
+# instead of a repaint. Animating here is the cheapest motion available: 256
+# words a frame, and the cost does not grow with the wall.
+palette: |
+  let f = ctx.frame as usize;
+  match i {
+      // The white ramp breathes. Nothing is redrawn to make this happen.
+      16..=31 => {
+          let cov = (i - 16) as u32;
+          let lift = 150 + (sin64(f / 8) + 256) as u32 * 100 / 512;
+          rgb((lift * cov / 15) as u8, (lift * cov / 15) as u8, (lift * cov / 15) as u8)
+      }
+      _ => crate::program::palette_default(i),
+  }
+
+widgets:
+  # Order is z-order: the first widget that inks a pixel wins.
+  #
+  # SPACING. `at` is the top of the BAND, not of the ink, and the band is the
+  # font's full line height. Measured ink offsets from the band top:
+  #     small (LH 17)   +4 .. +12   (+2 .. +15 with an ascender or descender)
+  #     big   (LH 36)   +6 .. +27   (+5 .. +33 likewise)
+  # Lay out against the ink, or two lines that look separate will overlap.
+  - text:  {at: [center, 8],  font: small, color: slate, value: "HELLO"}
+  - value: {at: [center, 30], font: big,   color: white, key: hhmm}
+  - value: {at: [center, 78], font: small, color: brass, key: temp,
+            prefix: "OUTSIDE ", suffix: "°"}
+
+  - lambda:
+      # `row:` runs ONCE PER ROW and its locals are visible in `px:` below.
+      # This is where anything that depends on y -- but not on x -- belongs.
+      row: |
+        let edge = y < 2 || y >= ctx.h - 2;
+
+      px: |
+        // The thing a streamed panel structurally cannot do: when the server
+        // dies it keeps showing a frame that looks perfectly correct. This one
+        // marks the corner instead.
+        if let Some(c) = stale_marker(ctx, x, y, 30_000, 6, ALERT) { return Some(c); }
+
+        // A border, rejected on the row first so the ~97% of pixels that are
+        // nowhere near an edge cost one comparison.
+        if edge || x < 2 || x >= ctx.w - 2 {
+            return Some(RAMP_SLATE + 10);
+        }
+        None
