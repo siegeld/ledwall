@@ -1,0 +1,10 @@
+[project]
+name = "marquee-core"
+version = "0.1.0"
+description = "Marquee scene language, renderer and panel protocol"
+requires-python = ">=3.11"
+dependencies = ["pydantic>=2.9", "PyYAML>=6", "pillow>=10", "SQLAlchemy>=2"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"

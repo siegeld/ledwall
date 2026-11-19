@@ -1,0 +1,16 @@
+# The build image for exp/build-out4.sh: the stock litex-hub75 image plus three
+# BIOS-size patches, without which the four-output SoC's ROM does not fit
+# alongside its line buffers. Build it from the repo root after the base image:
+#   docker build -t litex-hub75:out4 -f exp/Dockerfile.out4 exp
+# The BIOS keeps netboot (DHCP + TFTP boot.bin); it loses its serial commands,
+# which this board has no serial console to use.
+FROM litex-hub75
+# Let --gc-sections drop unreferenced BIOS functions.
+RUN sed -i 's/^COMMONFLAGS = \$(DEPFLAGS) -Os/COMMONFLAGS = $(DEPFLAGS) -Os -ffunction-sections -fdata-sections/' /litex/litex/litex/soc/software/common.mak \
+ && grep -c 'ffunction-sections' /litex/litex/litex/soc/software/common.mak
+# Link-time optimisation always on.
+RUN sed -i 's/^ifeq (\$(LTO), 1)/ifeq (1, 1)/' /litex/litex/litex/soc/software/common.mak \
+ && grep -c 'ifeq (1, 1)' /litex/litex/litex/soc/software/common.mak
+# No console command objects in the BIOS.
+RUN sed -i '/^\s*cmd_[a-z0-9]*\.o\s*\\\?\s*$/d; s/\bcmd_[a-z0-9]*\.o\b//g' /litex/litex/litex/soc/software/bios/Makefile \
+ && ! grep -q 'cmd_' /litex/litex/litex/soc/software/bios/Makefile && sed -n 8,16p /litex/litex/litex/soc/software/bios/Makefile

@@ -1,0 +1,19 @@
+diff --git a/src/lattice.cpp b/src/lattice.cpp
+index 89f0959..cbe348b 100644
+--- a/src/lattice.cpp
++++ b/src/lattice.cpp
+@@ -1268,6 +1268,14 @@ bool Lattice::wr_rd(uint8_t cmd,
+ 	uint8_t xfer_tx[kXferLen];
+ 	uint8_t xfer_rx[kXferLen];
+ 	memset(xfer_tx, 0, kXferLen);
++	/* xfer_rx is a stack VLA and was NEVER cleared. writeTDI() only ORs bits
++	 * in and relies on prior zeroing, so any gap left stack garbage in the
++	 * result -- which corrupted the IDCODE read inside program_mem() while
++	 * detectChain() (end == false, a different path) kept working. Symptom:
++	 * --detect reports the right IDCODE and programming aborts with
++	 * "mismatch between target's idcode and bitstream idcode".
++	 * Upstream: trabucayre/openFPGALoader#727. */
++	memset(xfer_rx, 0, kXferLen);
+ 	int i;
+ 	if (tx != NULL && tx_len > 0) {
+ 		for (i = 0; i < tx_len; i++)

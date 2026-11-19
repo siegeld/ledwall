@@ -1,0 +1,43 @@
+Give the PHY time to negotiate, and retry DHCP.
+
+The BIOS runs within milliseconds of FPGA configuration, but gigabit
+autonegotiation takes 1-3 seconds. `netboot()` sends ONE DHCP discover and, on
+no reply, falls through to the compiled-in addresses -- so the usual outcome at
+power-on is a card that asks before the link exists, boots nowhere, and sits
+silent. There is no retry anywhere in that path.
+
+Upstream: enjoy-digital/litex#2603, "BIOS netboot() has no PHY link wait or
+retry (fails at power-on)".
+
+This matters most on a card with nothing in flash to fall back to: netboot is
+then the ONLY boot medium, so one unlucky DHCP attempt is the difference
+between a working panel and a dead one. Retrying costs nothing on a card that
+already has link -- the first attempt answers and the loop exits.
+
+--- a/litex/soc/software/bios/boot.c
++++ b/litex/soc/software/bios/boot.c
+@@ -625,7 +625,23 @@
+ 	 * every card, including ones that will boot from flash anyway. */
+ 	{
+ 		struct udp_dhcp_lease lease;
+-		if(udp_dhcp_request(macadr, &lease)) {
++		int got = 0, tries;
++		/* Gigabit autonegotiation takes 1-3 s and the BIOS runs within
++		 * milliseconds of configuration, so the FIRST discover routinely
++		 * goes out before the link exists. One attempt with no retry
++		 * then means a card that boots nowhere and sits silent -- fatal
++		 * on a card with nothing in flash to fall back to, where netboot
++		 * is the only boot medium. See enjoy-digital/litex#2603.
++		 * A card that already has link answers on the first pass and
++		 * never waits. */
++		for(tries = 0; tries < 8 && !got; tries++) {
++			if(tries)
++				busy_wait(800);
++			got = udp_dhcp_request(macadr, &lease);
++		}
++		if(got) {
++			if(tries > 1)
++				printf("DHCP: answered on attempt %d\n", tries);
+ 			if(lease.local_ip) {
+ 				local_ip[0] = (lease.local_ip >> 24) & 0xff;
+ 				local_ip[1] = (lease.local_ip >> 16) & 0xff;

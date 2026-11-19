@@ -1,0 +1,29 @@
+#!/bin/bash
+# Load Myled's FACTORY register table (per colour) into a running card.
+# Values are tag 0x84 of the vendor's receiver profile
+# (factory/myled-COB-p1.25-*-1065L.rcvbp, decoded by tools/decode_rcvbp.py).
+# Indexes are positions in the icnd1065 table (gateware/spwm_chips.py).
+# Revert with tools/icnd1065_live.sh. docs/PANELS.md, "Myled P1.25".
+#   REG02=0x7f tools/icnd1065_factory_regs.sh   # also take the profile's bit 6
+C=${1:-http://192.168.1.62}
+R02=${REG02:-0x3f}
+# index addr r g b
+while read -r i a r g b; do
+  curl -s -m5 -X POST "$C/api/chipreg" -H 'Content-Type: application/json' \
+    -d "{\"index\":$i,\"r\":$((a<<8|r)),\"g\":$((a<<8|g)),\"b\":$((a<<8|b))}" >/dev/null
+done <<T
+2 0x02 $R02 $R02 $R02
+3 0x03 0x3f 0x3f 0x3f
+4 0x04 0x2c 0x2c 0x2c
+7 0x07 0x10 0x10 0x10
+8 0x0c 0x01 0x0e 0x0e
+9 0x0d 0x01 0x05 0x03
+11 0x0f 0x01 0x01 0x11
+20 0x19 0x07 0x08 0x0b
+21 0x1c 0x25 0x3d 0x26
+22 0x1d 0x86 0xc6 0xaa
+23 0x1e 0xa1 0xb3 0x85
+25 0x20 0x40 0x40 0x60
+28 0x23 0x40 0x43 0x40
+T
+echo "factory registers loaded into $C (reg 0x02 = $R02)"

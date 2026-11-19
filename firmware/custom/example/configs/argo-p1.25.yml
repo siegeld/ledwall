@@ -1,0 +1,24 @@
+# ARGO's P1.25 module (256x128, Depuw DP3264S, HUB320) on an E320.
+# docs/PANELS.md has the module's record; this is the layout that drives it.
+#
+# Bitstream: PANEL=256x128-dp3264s-hub320 exp/build-rt.sh   (four outputs)
+# Bake it in:
+#   PANEL=256x128-dp3264s-hub320 exp/build-rt.sh \
+#     --default-config custom/example/configs/argo-p1.25.yml firmware
+#
+# One module on J1. For more, stack them: grid 1xN and one J line each
+# (J1: 0,0 / J2: 0,1 / J3: 0,2 / J4: 0,3), top to bottom. Four on one card is
+# a 256x512 picture; three have run on this exact layout at grid 1x3.
+grid: 1x1
+panel_width: 256
+panel_height: 128
+J1: 0,0
+
+# The module's four RGB groups are 128x64 quadrants in a 2x2, not strips:
+# g0 top-right, g1 bottom-right, g2 top-left, g3 bottom-left.
+drive: dp3264s
+group_origins: 128,0 128,64 0,0 0,64
+
+# 8.75 MHz panel clock, 66.7 Hz refresh. 6 is 44 Hz, which flickers in
+# near-black content.
+clk_div: 4

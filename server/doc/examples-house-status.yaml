@@ -1,0 +1,39 @@
+# Dashboard house status — two 128x64 panels side by side.
+#
+# Sized 256x64 because that is what two panels one-per-connector gives you.
+# Everything here is placed against that, not against the 256x192 wall.
+#
+# Type sizes are all >= 12px deliberately. HUB75.md records that below ~10px no
+# outline face works at any weight -- the info display had 0 and 8 render as the
+# same blob at 8px -- and marquee's default face is DejaVu, an outline font. If
+# something has to be smaller than 12 here, it needs a pixel-grid font first.
+#
+# format: indexed -- this content is flat colour and text, which quantises to
+# 256 colours losslessly, and it buys ~3x the frame rate.
+display: {width: 256, height: 64, fps: 10, format: indexed}
+transition: {type: crossfade, duration: 0.6s}
+scenes:
+  - name: house
+    duration: 20s
+    layers:
+      # ---- left panel: outside ----------------------------------------
+      - {type: text, text: "OUTSIDE", box: [4, 1, 120, 13],
+         size: 12, color: "#5f7fb0", align: left}
+      - {type: text, text: "{ha:sensor.dashboard_realfeel_temperature}",
+         box: [4, 15, 120, 32], size: 30, color: "#e8e8f0", align: left}
+      - {type: text, text: "{ha:weather.dashboard}", box: [4, 48, 120, 15],
+         size: 12, color: "#8090a8", align: left}
+
+      # ---- right panel: lights, with 24h history -----------------------
+      # lumen_lights_on is a good thing to graph: it has real daily shape, so a
+      # glance at the trace says more than the number does.
+      # "LIGHTS ON" clipped to "LIGHTS O" at size 12 in a 68px box. HUB75.md:
+      # no font fixes text that does not FIT -- so the label got shorter rather
+      # than the type getting smaller, which at 12px would have been unreadable
+      # anyway. The number beside it makes "ON" redundant.
+      - {type: text, text: "LIGHTS", box: [132, 1, 60, 13],
+         size: 12, color: "#5f7fb0", align: left}
+      - {type: text, text: "{ha:sensor.lumen_lights_on}", box: [192, 1, 60, 13],
+         size: 12, color: "#e8e8f0", align: right}
+      - {type: graph, entity: sensor.lumen_lights_on, hours: 24,
+         box: [132, 16, 120, 47], color: "#c9a84c", fill: true, baseline: true}

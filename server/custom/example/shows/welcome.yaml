@@ -1,0 +1,18 @@
+# name: welcome
+# description: A minimal show -- a gradient, a title and a live clock.
+#
+# Copy custom/example/ to custom/<your-site>/ and edit. Load it with:
+#   make shows-import SITE=<your-site>
+#
+# Bindings like {clock:...} are resolved at render time. A binding that fails
+# renders an em dash rather than raising -- a sign that goes black because an
+# API timed out is worse than one showing a stale value.
+display: {width: 256, height: 128, fps: 15, format: rgb}
+scenes:
+  - name: welcome
+    duration: 60s
+    layers:
+      - {type: gradient, start: "#05070d", end: "#132033", box: [0,0,256,128], angle: v}
+      - {type: text, text: "HELLO", box: [0,18,256,40], size: 32, align: center, color: "#C9A84C"}
+      - {type: text, text: "{clock:%H:%M:%S}", box: [0,66,256,34], size: 26, align: center, color: "#e6edf3"}
+      - {type: text, text: "{date:%a %d %b}", box: [0,102,256,20], size: 14, align: center, color: "#8b9bb4"}
